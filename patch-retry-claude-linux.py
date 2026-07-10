@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-patch-retry-claude.py - Patch Claude Code binary to:
+patch-retry-claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
   1. Remove the retry cap so CLAUDE_CODE_MAX_RETRIES=9999 works
   2. Replace exponential backoff with fixed 1s interval
   3. Patch the Anthropic SDK's built-in retry backoff
   4. Lower rate-limit fallback delays
 
-Cross-platform: works on Linux, macOS, and Windows. Platform-specific
-behaviour (binary discovery, atomic write, command hints) is selected at
-runtime via os.name.
+Linux/macOS-only build of patch-retry-claude. The byte patches are the minified
+JS text embedded in the binary and are identical on every platform; only binary
+discovery, the atomic write's exec bit, and the command hints are Unix-specific
+here. For Windows use patch-retry-claude-windows.py.
 
 Usage:
-  Linux/macOS:  sudo python3 patch-retry-claude.py [--check] [--restore]
-  Windows:      python patch-retry-claude.py [--check] [--restore]
+  sudo python3 patch-retry-claude-linux.py [--check] [--restore]
 
 Options:
   --check     Show what would be changed without modifying the binary
@@ -34,65 +34,54 @@ import shutil
 import subprocess
 import sys
 
-IS_WINDOWS = os.name == "nt"
-PROC_NAME = "claude.exe" if IS_WINDOWS else "claude"
-STOP_HINT = "Close it first." if IS_WINDOWS else "Stop it first."
+PROC_NAME = "claude"
+STOP_HINT = "Stop it first."
+
+
+def require_platform() -> None:
+    """Refuse to run outside Linux/macOS.
+
+    This build hardcodes Unix binary discovery (`which`, POSIX npm paths) and
+    sets the exec bit on write; running it on Windows would mis-locate the
+    binary and produce a non-executable file. Direct Windows users to the
+    dedicated script instead of failing later with a confusing error.
+    """
+    if os.name != "posix":
+        print(f"ERROR: this is the Linux/macOS build, but the current OS is "
+              f"'{sys.platform}' (os.name={os.name!r}).", file=sys.stderr)
+        print("Use patch-retry-claude-windows.py on Windows.", file=sys.stderr)
+        sys.exit(1)
 
 
 def find_binary() -> str:
-    """Find the Claude Code binary path (Windows or Unix)."""
+    """Find the Claude Code binary path (Linux/macOS)."""
     candidates = []
 
-    if IS_WINDOWS:
-        # Try npm shim location first, e.g. %APPDATA%\npm\claude.cmd
-        for shim in (shutil.which("claude"), shutil.which("claude.cmd"), shutil.which("claude.exe")):
-            if not shim:
-                continue
-            if os.path.basename(shim).lower() == "claude.exe" and os.path.isfile(shim):
-                return os.path.realpath(shim)
-            candidates.append(os.path.join(
-                os.path.dirname(shim),
-                "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe",
-            ))
+    # Try `which claude` first
+    try:
+        result = subprocess.run(
+            ["which", "claude"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            path = os.path.realpath(result.stdout.strip())
+            if os.path.isfile(path):
+                return path
+    except Exception:
+        pass
 
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            candidates.append(os.path.join(
-                appdata, "npm", "node_modules", "@anthropic-ai",
-                "claude-code", "bin", "claude.exe",
-            ))
-    else:
-        # Try `which claude` first
-        try:
-            result = subprocess.run(
-                ["which", "claude"], capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                path = os.path.realpath(result.stdout.strip())
-                if os.path.isfile(path):
-                    return path
-        except Exception:
-            pass
-
-    # Fallback: look in npm global packages (both platforms)
+    # Fallback: look in npm global packages
     try:
         result = subprocess.run(
             ["npm", "root", "-g"], capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
             npm_root = result.stdout.strip()
-            if IS_WINDOWS:
-                candidates.append(os.path.join(
-                    npm_root, "@anthropic-ai", "claude-code", "bin", "claude.exe",
-                ))
-            else:
-                candidates += [
-                    os.path.join(npm_root, "@anthropic-ai/claude-code/bin/claude.exe"),
-                    os.path.join(npm_root, "@anthropic-ai/claude-code-linux-x64/claude"),
-                    os.path.join(npm_root, "@anthropic-ai/claude-code-linux-arm64/claude"),
-                    os.path.join(npm_root, "@anthropic-ai/claude-code-darwin-arm64/claude"),
-                    os.path.join(npm_root, "@anthropic-ai/claude-code-darwin-x64/claude"),
-                ]
+            candidates += [
+                os.path.join(npm_root, "@anthropic-ai/claude-code-linux-x64/claude"),
+                os.path.join(npm_root, "@anthropic-ai/claude-code-linux-arm64/claude"),
+                os.path.join(npm_root, "@anthropic-ai/claude-code-darwin-arm64/claude"),
+                os.path.join(npm_root, "@anthropic-ai/claude-code-darwin-x64/claude"),
+            ]
     except Exception:
         pass
 
@@ -279,9 +268,8 @@ def write_patched(binary_path: str, data: bytearray) -> None:
     """Atomically replace the binary with the patched bytes.
 
     Uses a temp file + os.replace(), which is atomic and overwrites the
-    destination on both POSIX and Windows. On Linux this swaps the inode, so
-    a running process keeps its old mapping; on Windows os.replace fails if
-    the target is locked (claude.exe running).
+    destination. On Linux this swaps the inode, so a running process keeps its
+    old mapping.
     """
     import tempfile
     binary_dir = os.path.dirname(binary_path)
@@ -289,8 +277,7 @@ def write_patched(binary_path: str, data: bytearray) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        if not IS_WINDOWS:
-            os.chmod(tmp_path, 0o755)
+        os.chmod(tmp_path, 0o755)
         os.replace(tmp_path, binary_path)
     except Exception:
         try:
@@ -302,11 +289,13 @@ def write_patched(binary_path: str, data: bytearray) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Patch Claude Code binary: allow 9999 retries, fix backoff to 1s interval"
+        description="Patch Claude Code binary (Linux/macOS): allow 9999 retries, fix backoff to 1s interval"
     )
     parser.add_argument("--check", action="store_true", help="Show changes without modifying the binary")
     parser.add_argument("--restore", action="store_true", help="Restore the original binary from backup")
     args = parser.parse_args()
+
+    require_platform()
 
     binary_path = find_binary()
     print(f"Found binary: {binary_path}")
@@ -322,8 +311,7 @@ def main():
         print(f"Restoring original binary from {backup_path} ...")
         try:
             shutil.copy2(backup_path, binary_path)
-            if not IS_WINDOWS:
-                os.chmod(binary_path, 0o755)
+            os.chmod(binary_path, 0o755)
             print("Restored successfully.")
         except OSError as e:
             print(f"ERROR: Failed to restore: {e}", file=sys.stderr)
@@ -338,12 +326,10 @@ def main():
     # -- Refuse if already patched by this script (avoid double-patching) -------
     # Done before backup so a patched binary is never copied over a good .orig.
     if looks_already_patched(data):
-        py = "python" if IS_WINDOWS else "python3"
-        sudo = "" if IS_WINDOWS else "sudo "
         print()
         print("This binary already appears to be patched by this script.")
         print("Restore the original first, then re-run:")
-        print(f"  {sudo}{py} {sys.argv[0]} --restore")
+        print(f"  sudo python3 {sys.argv[0]} --restore")
         sys.exit(1)
 
     # -- Create backup (skip in --check: it must not touch disk) ----------------
@@ -551,19 +537,13 @@ def main():
         print(f"Is {PROC_NAME} running? {STOP_HINT} Then re-run this script.", file=sys.stderr)
         sys.exit(1)
 
-    # -- Final hints (platform-specific) ---------------------------------------
-    py = "python" if IS_WINDOWS else "python3"
-    sudo = "" if IS_WINDOWS else "sudo "
+    # -- Final hints -----------------------------------------------------------
     print()
     print("To restore the original binary:")
-    print(f"  {sudo}{py} {sys.argv[0]} --restore")
+    print(f"  sudo python3 {sys.argv[0]} --restore")
     print()
-    if IS_WINDOWS:
-        print("Set this PowerShell environment variable before running claude:")
-        print('  $env:CLAUDE_CODE_MAX_RETRIES="9999"       # Max retry attempts (internal cap disabled)')
-    else:
-        print("Set this environment variable before running claude:")
-        print("  export CLAUDE_CODE_MAX_RETRIES=9999       # Max retry attempts (internal cap disabled)")
+    print("Set this environment variable before running claude:")
+    print("  export CLAUDE_CODE_MAX_RETRIES=9999       # Max retry attempts (internal cap disabled)")
     print()
     print("Retry behavior after patching:")
     sep = "  +-------------------------+----------------------------------+"

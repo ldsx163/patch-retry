@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Patch Codex CLI's retry backoff interval -- universal (Linux/macOS + Windows).
+Patch Codex CLI's retry backoff interval -- Windows build (PE / x86-64).
 
-Verified against codex rust-v0.143.0 (x86_64-unknown-linux-musl) and v0.144.1
-(x86_64-pc-windows-msvc). The two
-jittered backoffs it targets are:
+Verified against codex rust-v0.144.1 (x86_64-pc-windows-msvc). This is the
+Windows (PE) build of the codex patcher; for the Linux/macOS ELF/Mach-O build
+use patch-codex-retry-linux.py. The two jittered backoffs it targets are:
 
   1. codex-client/src/retry.rs::backoff(base, attempt)  -- generic retry path
        `sleep(backoff(policy.base_delay, attempt+1))`.
@@ -31,29 +31,38 @@ with `mov <millis_reg>, <ms>` (+ NOP padding), so the native from_millis
 codegen that follows splits our constant into {secs, nanos} unchanged. The
 result is a fixed retry interval independent of base delay, attempt, and jitter.
 
-Location is build-agnostic and works on ELF / Mach-O / PE alike (same x86-64
-Rust codegen), anchored on:
-  * the single 0.9 rodata constant from `0.9..1.1` (deduped across both sites);
-  * an `addsd xmm,[rip->0.9]` or `movsd xmm,[rip->0.9]` that consumes it
-    (`movsd` candidates are accepted only when the from_millis tail also matches,
-    because unrelated code loads the same constant);
-  * the `mov rax,reg / shr rax,3 / movabs <from_millis magic>` tail.
+Windows/PE specifics this build carries that the Linux build does not:
+  * RIP-relative operands resolve in VA space, so `next_instr_VA + disp` must be
+    compared against the *VA* of the 0.9 constant. PE gives each section an
+    independent VirtualAddress vs PointerToRawData (FileAlignment 0x200 !=
+    SectionAlignment 0x1000), so `.text`/`.rdata` `VA - file_offset` deltas
+    differ. build_pe_off2va() translates file offsets to VAs for the compare.
+  * MSVC loads the 0.9 lower bound with either `addsd [0.9]` or (one backoff
+    path in v0.144.1) `movsd [0.9]`. Since movsd also appears in unrelated math,
+    a movsd anchor is accepted only when the full from_millis/mulsd/span chain
+    downstream also matches.
+  * The millis value may live in an extended register r8..r15 (REX prefixes
+    0x4c on the mov, 0x41 on the rewritten `mov r8d,imm32`).
 
 Site 3 (stream_max_retries().min(100) hard cap) is unchanged from prior builds:
 the inlined `unwrap_or(5).min(100)` codegen is byte-identical, so the same tail
 signature locates every inlined copy and we rewrite the cap immediate to
 STREAM_MAX_RETRIES so a large stream_max_retries in config.toml is honored.
 
+Known coverage gap: in the v0.144.1 MSVC build one backoff uses `addsd [0.9]`
+and the other a bare `movsd [0.9]` whose downstream chain the anchors do not
+fully match, so typically only one of the two paths is fixed to 1000ms; the
+other keeps native jittered backoff. Re-check after each codex upgrade.
+
 This changes the retry *interval*, not the retry *count*; use config.toml's
 stream_max_retries/request_max_retries for the count (site 3 just unclamps the
 stream cap so values >100 take effect).
 
 Usage:
-  python3 patch-codex-retry.py --check           (Linux/macOS: inspect only)
-  py      patch-codex-retry.py --check           (Windows: inspect only)
-  sudo python3 patch-codex-retry.py              (apply the patch)
-  python3 patch-codex-retry.py --restore
-  python3 patch-codex-retry.py --self-test
+  py patch-codex-retry-windows.py --check        (inspect only)
+  py patch-codex-retry-windows.py                (apply the patch)
+  py patch-codex-retry-windows.py --restore
+  py patch-codex-retry-windows.py --self-test
 
 The retry interval and stream cap are fixed (RETRY_MS / STREAM_MAX_RETRIES).
 """
@@ -71,10 +80,6 @@ from pathlib import Path
 
 
 PLATFORM_TARGETS = {
-    ("Linux", "x86_64"): ("@openai/codex-linux-x64", "x86_64-unknown-linux-musl", "codex"),
-    ("Linux", "aarch64"): ("@openai/codex-linux-arm64", "aarch64-unknown-linux-musl", "codex"),
-    ("Darwin", "x86_64"): ("@openai/codex-darwin-x64", "x86_64-apple-darwin", "codex"),
-    ("Darwin", "arm64"): ("@openai/codex-darwin-arm64", "aarch64-apple-darwin", "codex"),
     ("Windows", "AMD64"): ("@openai/codex-win32-x64", "x86_64-pc-windows-msvc", "codex.exe"),
     ("Windows", "ARM64"): ("@openai/codex-win32-arm64", "aarch64-pc-windows-msvc", "codex.exe"),
 }
@@ -102,10 +107,23 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+def require_platform() -> None:
+    """Refuse to run outside Windows.
+
+    This build only understands PE images (VA translation, MSVC movsd anchor)
+    and Windows binary discovery; a Linux/macOS ELF/Mach-O needs the file-offset
+    path in patch-codex-retry-linux.py. Fail fast with that pointer."""
+    if os.name != "nt":
+        print(f"ERROR: this is the Windows build, but the current OS is "
+              f"'{sys.platform}' (os.name={os.name!r}).", file=sys.stderr)
+        print("Use patch-codex-retry-linux.py on Linux/macOS.", file=sys.stderr)
+        sys.exit(1)
+
+
 # ── Format / architecture detection (dispatch + safety gate) ──────────────────
 def detect_format(data: bytes) -> str:
-    """Return 'pe' | 'elf' | 'macho', or die. Refuses non-x86-64 binaries, since
-    every byte pattern below is x86-64 specific."""
+    """Return 'pe', or die. Refuses ELF/Mach-O (Linux build) and non-x86-64
+    PE, since every byte pattern below is x86-64 PE specific."""
     if data[:2] == b"MZ":
         e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
         if data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
@@ -113,17 +131,11 @@ def detect_format(data: bytes) -> str:
         if struct.unpack_from("<H", data, e_lfanew + 4)[0] != 0x8664:
             die("not an x86-64 PE (this patch is x86-64 only)")
         return "pe"
-    if data[:4] == b"\x7fELF":
-        if struct.unpack_from("<H", data, 18)[0] != 0x3E:
-            die("ELF is not x86-64 (e_machine != 0x3E); this patch is x86-64 only")
-        return "elf"
-    if data[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):  # Mach-O LE
-        if struct.unpack_from("<I", data, 4)[0] != 0x01000007:
-            die("Mach-O is not x86_64 (arm64 uses a different ISA/ABI; unsupported)")
-        return "macho"
-    if data[:4] in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
-        die("fat/universal Mach-O not supported; extract the x86_64 slice first")
-    die("unrecognized binary format (expected ELF, Mach-O, or PE)")
+    if data[:4] == b"\x7fELF" or data[:4] in (
+            b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
+            b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+        die("this is an ELF/Mach-O binary; use patch-codex-retry-linux.py")
+    die("unrecognized binary format (expected a Windows PE)")
 
 
 def build_pe_off2va(data: bytes):
@@ -133,8 +145,7 @@ def build_pe_off2va(data: bytes):
     compared against the *VA* of the target constant. PE gives each section an
     independent VirtualAddress vs PointerToRawData (FileAlignment 0x200 !=
     SectionAlignment 0x1000), so the `.text` and `.rdata` `VA - file_offset`
-    deltas differ -- unlike the single-mapping ELF the file-offset math assumes.
-    ELF/Mach-O keep the plain file-offset path (off2va=None) and are unaffected."""
+    deltas differ -- there is no single file-offset mapping as on ELF."""
     e = struct.unpack_from("<I", data, 0x3C)[0]
     nsec = struct.unpack_from("<H", data, e + 6)[0]
     opt = struct.unpack_from("<H", data, e + 20)[0]   # SizeOfOptionalHeader
@@ -177,7 +188,9 @@ def _find_09_constant(data: bytes) -> int:
 
 
 def _rip_f64_sites(data: bytes, constant: int, off2va, opcode: int) -> list[int]:
-    """Offsets of an SSE2 f64 instruction reading a RIP-relative constant."""
+    """Offsets of an SSE2 f64 instruction (opcode: 0x58 addsd / 0x10 movsd)
+    reading the RIP-relative `constant`. `off2va` maps a file offset to the VA
+    used for RIP resolution (PE translates both sides to VA)."""
     constant_va = off2va(constant)
     sites = []
     for pref in (b"\xf2\x0f" + bytes([opcode]),
@@ -194,11 +207,7 @@ def _rip_f64_sites(data: bytes, constant: int, off2va, opcode: int) -> list[int]
 
 
 def _addsd_09_sites(data: bytes, c09: int, off2va) -> list[int]:
-    """Offsets of `addsd xmm,[rip->0.9]`.
-
-    `off2va` maps a file offset to the VA used for RIP resolution. For ELF/Mach-O
-    (and the self-test's raw buffer) it is the identity, so the check reduces to
-    the original file-offset comparison; for PE it translates both sides to VA."""
+    """Offsets of `addsd xmm,[rip->0.9]`."""
     return _rip_f64_sites(data, c09, off2va, 0x58)
 
 
@@ -240,14 +249,14 @@ def find_jitter_sites(data: bytes, off2va=None) -> list[dict]:
     """Locate every `Duration::from_millis(delay*jitter)` site keyed on 0.9..1.1.
     Each dict: {anchor, region_start, region_end, reg, current}.
 
-    `off2va` (PE only) translates file offsets to VAs for RIP resolution; when
-    None the RIP check stays in file-offset space (ELF/Mach-O, self-test)."""
+    `off2va` translates file offsets to VAs for RIP resolution; when None the RIP
+    check stays in file-offset space (used only by the self-test's raw buffer)."""
     if off2va is None:
         off2va = lambda f: f  # identity: RIP resolution in file-offset space
     c09 = _find_09_constant(data)
     out = []
-    # Newer MSVC builds use `movsd [0.9]` for one backoff path. Unlike `addsd`,
-    # movsd also occurs in unrelated math, so only accept it with every later
+    # MSVC builds use `movsd [0.9]` for one backoff path. Unlike `addsd`, movsd
+    # also occurs in unrelated math, so only accept it with every later
     # from_millis/mulsd/span check satisfied.
     anchors = ([(i, True) for i in _addsd_09_sites(data, c09, off2va)]
                + [(i, False) for i in _movsd_09_sites(data, c09, off2va)])
@@ -321,9 +330,8 @@ def plan(data: bytes, ms: int, off2va=None):
     """Return (edits, report). edits: [(off, bytes)]. report: [(label, where, current)]."""
     edits, report = [], []
     sites = find_jitter_sites(data, off2va)
-    if len(sites) < len(SITE_LABELS):
-        die(f"expected at least {len(SITE_LABELS)} jittered backoff sites "
-            f"(0.9..1.1), found {len(sites)}")
+    if len(sites) < 1:
+        die("found no jittered backoff sites (0.9..1.1)")
     for idx, s in enumerate(sites):
         label = SITE_LABELS[idx] if idx < len(SITE_LABELS) else f"backoff[{idx}]"
         patch = make_jitter_patch(s["reg"], s["region_end"] - s["region_start"], ms)
@@ -335,12 +343,10 @@ def plan(data: bytes, ms: int, off2va=None):
 # ── Binary discovery ──────────────────────────────────────────────────────────
 def is_native_binary(path: Path) -> bool:
     try:
-        head = path.read_bytes()[:4]
+        head = path.read_bytes()[:2]
     except OSError:
         return False
-    return (head[:2] == b"MZ" or head == b"\x7fELF"
-            or head in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
-                        b"\xca\xfe\xba\xbe"))
+    return head == b"MZ"
 
 
 def target_info() -> tuple[str, str, str]:
@@ -351,8 +357,8 @@ def target_info() -> tuple[str, str, str]:
 
 
 def package_root_from_wrapper(wrapper: Path):
-    # npm wrapper layouts: .../@openai/codex/bin/codex(.js), or Windows global
-    # shims at .../npm/codex(.cmd|.ps1) next to node_modules/@openai/codex.
+    # Windows global shims at .../npm/codex(.cmd|.ps1) next to
+    # node_modules/@openai/codex, or a bin/codex(.js) wrapper.
     if wrapper.name in {"codex", "codex.js", "codex.cmd", "codex.ps1"} \
             and wrapper.parent.name in {"bin", "npm"}:
         for root in (wrapper.parent.parent,
@@ -385,12 +391,9 @@ def find_binary(explicit: str | None) -> Path:
         found = shutil.which(cmd)
         if found:
             candidates.append(Path(found).resolve())
-    for root in ("/usr/lib/node_modules/@openai/codex",
-                 "/usr/local/lib/node_modules/@openai/codex"):
-        candidates.append(Path(root))
     try:
         npm_root = subprocess.run(["npm", "root", "-g"], capture_output=True,
-                                  text=True, timeout=10, shell=(os.name == "nt"))
+                                  text=True, timeout=10, shell=True)
         if npm_root.returncode == 0 and npm_root.stdout.strip():
             candidates.append(Path(npm_root.stdout.strip()) / "@openai" / "codex")
     except Exception:
@@ -409,7 +412,7 @@ def find_binary(explicit: str | None) -> Path:
             if binary:
                 return binary
 
-    die("could not find native Codex binary; pass --binary /path/to/codex[.exe]")
+    die("could not find native Codex binary; pass --binary C:\\path\\to\\codex.exe")
 
 
 # ── Patch driver ──────────────────────────────────────────────────────────────
@@ -418,10 +421,10 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     if not (1 <= max_retries <= 0xFFFF_FFFF):
         die("STREAM_MAX_RETRIES must be between 1 and 4294967295")
     data = bytearray(binary.read_bytes())
-    fmt = detect_format(bytes(data))
+    fmt = detect_format(bytes(data))  # pe only; ELF/Mach-O rejected
 
-    # PE resolves RIP-relative operands in VA space; ELF/Mach-O keep file offsets.
-    off2va = build_pe_off2va(bytes(data)) if fmt == "pe" else None
+    # PE resolves RIP-relative operands in VA space.
+    off2va = build_pe_off2va(bytes(data))
     edits, report = plan(data, ms, off2va)
 
     cap_sites = find_stream_cap_sites(data)
@@ -455,7 +458,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     for s in cap_sites:
         data[s + 1 : s + 5] = cap_bytes
 
-    mode = binary.stat().st_mode  # preserve permissions (esp. the exec bit)
+    mode = binary.stat().st_mode  # preserve permissions
     tmp = binary.with_name(binary.name + ".tmp")
     tmp.write_bytes(data)
     os.chmod(tmp, mode)
@@ -525,16 +528,23 @@ def self_test() -> None:
     magic = unrelated.find(FROM_MILLIS_MAGIC)
     unrelated[magic:magic + len(FROM_MILLIS_MAGIC)] = b"\x00" * len(FROM_MILLIS_MAGIC)
     assert find_jitter_sites(bytes(unrelated)) == []
-    # format detection
-    assert detect_format(b"\x7fELF" + b"\x00" * 14 + b"\x3e\x00" + b"\x00" * 8) == "elf"
+    # format detection: PE accepted, ELF rejected via die()/SystemExit.
+    assert detect_format(b"MZ" + b"\x00" * 0x3a + struct.pack("<I", 0x40)
+                         + b"PE\x00\x00" + struct.pack("<H", 0x8664)) == "pe"
+    try:
+        detect_format(b"\x7fELF" + b"\x00" * 16)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("ELF should be rejected by the Windows build")
     print("self-test OK")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Patch Codex native binary retry backoff interval "
-                    "(Linux/macOS ELF/Mach-O + Windows PE, x86-64)")
-    parser.add_argument("--binary", help="path to native codex/codex.exe binary")
+                    "(Windows PE, x86-64)")
+    parser.add_argument("--binary", help="path to native codex.exe binary")
     parser.add_argument("--check", action="store_true", help="inspect only; do not write or back up")
     parser.add_argument("--restore", action="store_true", help="restore binary from .orig backup")
     parser.add_argument("--self-test", action="store_true", help="run small internal checks")
@@ -544,6 +554,7 @@ def main() -> None:
         self_test()
         return
 
+    require_platform()
     binary = find_binary(args.binary)
     if args.restore:
         restore_binary(binary)
