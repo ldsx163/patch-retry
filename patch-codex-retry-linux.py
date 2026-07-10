@@ -88,6 +88,14 @@ FROM_MILLIS_MAGIC = bytes.fromhex("cff753e3a59bc420")  # 0x20c49ba5e353f7cf, LE
 # `mov <reg32>, imm32` opcode base; the low 3 bits select the register.
 MOV_R32_IMM = 0xB8
 
+# 32-bit GP register names by 4-bit register number (for readable logs).
+REG_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+             "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d")
+
+
+def reg_name(reg: int) -> str:
+    return REG_NAMES[reg] if 0 <= reg < len(REG_NAMES) else f"reg{reg}"
+
 MS_MIN, MS_MAX = 1, 86_400_000  # 1ms .. 24h; also keeps the imm32 non-negative
 REGION_MIN, REGION_MAX = 5, 256  # sanity bounds on the span we overwrite
 
@@ -223,9 +231,9 @@ def find_jitter_sites(data: bytes) -> list[dict]:
     # Newer codex builds (>=0.144.x) use `movsd [0.9]` for one backoff path.
     # Unlike `addsd`, movsd also occurs in unrelated math, so only accept it with
     # every later from_millis/mulsd/span check satisfied.
-    anchors = ([(i, True) for i in _addsd_09_sites(data, c09)]
-               + [(i, False) for i in _movsd_09_sites(data, c09)])
-    for anchor, strict in sorted(anchors):
+    anchors = ([(i, True, "addsd") for i in _addsd_09_sites(data, c09)]
+               + [(i, False, "movsd") for i in _movsd_09_sites(data, c09)])
+    for anchor, strict, kind in sorted(anchors):
         tail = _find_from_millis_tail(data, anchor)
         if tail is None:
             if strict:
@@ -257,8 +265,9 @@ def find_jitter_sites(data: bytes) -> list[dict]:
         rex_ok = reg < 8 or data[region_start] == 0x41
         if rex_ok and (data[base] & 0xF8) == MOV_R32_IMM and (data[base] & 7) == (reg & 7):
             current = struct.unpack_from("<I", data, base + 1)[0]
-        out.append({"anchor": anchor, "region_start": region_start,
-                    "region_end": region_end, "reg": reg, "current": current})
+        out.append({"anchor": anchor, "kind": kind, "mulsd": mul[0], "tail": mv,
+                    "region_start": region_start, "region_end": region_end,
+                    "reg": reg, "current": current})
     return out
 
 
@@ -292,7 +301,7 @@ SITE_LABELS = ("retry.rs::backoff", "util.rs::backoff")
 
 
 def plan(data: bytes, ms: int):
-    """Return (edits, report). edits: [(off, bytes)]. report: [(label, where, current)]."""
+    """Return (edits, report). edits: [(off, bytes)]. report: [(label, site)]."""
     edits, report = [], []
     sites = find_jitter_sites(data)
     if len(sites) < len(SITE_LABELS):
@@ -302,7 +311,7 @@ def plan(data: bytes, ms: int):
         label = SITE_LABELS[idx] if idx < len(SITE_LABELS) else f"backoff[{idx}]"
         patch = make_jitter_patch(s["reg"], s["region_end"] - s["region_start"], ms)
         edits.append((s["region_start"], patch))
-        report.append((label, f"@ 0x{s['region_start']:x}", s["current"]))
+        report.append((label, s))
     return edits, report
 
 
@@ -391,30 +400,56 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     data = bytearray(binary.read_bytes())
     fmt = detect_format(bytes(data))  # elf/macho only; PE is rejected
 
-    edits, report = plan(data, ms)
-
-    cap_sites = find_stream_cap_sites(data)
-    cap_now = current_stream_caps(data)
+    print(f"Found binary: {binary}")
+    print(f"Binary size:  {len(data)} bytes  [{fmt.upper()} x86-64]")
 
     def fmt_ms(v):
         return "unpatched" if v is None else f"{v}ms"
 
-    print(f"Found binary: {binary}  [{fmt.upper()} x86-64]")
-    for label, where, before in report:
-        print(f"  {label:18} {where} (current: {fmt_ms(before)})")
+    # -- Sites 1 & 2: jitter -> fixed interval --------------------------------
+    print()
+    print("=== Jitter backoff sites (random_range 0.9..1.1) ===")
+    c09 = _find_09_constant(data)
+    print(f"  0.9 jitter constant @ 0x{c09:x} (single, shared by both backoffs)")
+    edits, report = plan(data, ms)
+    for idx, (label, s) in enumerate(report, 1):
+        span = s["region_end"] - s["region_start"]
+        print(f"  [{idx}] {label}")
+        print(f"        anchor  : {s['kind']} xmm,[rip->0.9] @ 0x{s['anchor']:x}")
+        print(f"        mulsd   : final reg-form @ 0x{s['mulsd']:x}")
+        print(f"        millis  : from_millis reads {reg_name(s['reg'])} "
+              f"(mov tail @ 0x{s['tail']:x})")
+        print(f"        rewrite : [0x{s['region_start']:x},0x{s['region_end']:x}) "
+              f"span {span}B -> mov {reg_name(s['reg'])},{ms} + NOPs")
+        print(f"        current : {fmt_ms(s['current'])} -> {ms}ms")
+
+    # -- Site 3: stream_max_retries cap ---------------------------------------
+    print()
+    print("=== stream_max_retries hard cap ===")
+    cap_sites = find_stream_cap_sites(data)
+    cap_now = current_stream_caps(data)
     if cap_sites:
-        print(f"  stream_max_retries cap @ {len(cap_sites)} site(s) "
-              f"(current: {cap_now}) -> {max_retries}")
+        locs = ", ".join(f"0x{s:x}" for s in cap_sites)
+        print(f"  {len(cap_sites)} inlined site(s): {locs}")
+        print(f"  current cap: {cap_now} -> {max_retries}")
     else:
-        print("  stream_max_retries cap NOT FOUND - skipping (cap stays 100)")
-    print(f"New retry interval: {ms}ms")
+        print("  NOT FOUND - skipping (cap stays 100)")
+
+    # -- Summary --------------------------------------------------------------
+    print()
+    print("=== Summary ===")
+    print(f"  jitter sites : {len(report)} to patch -> {ms}ms fixed interval")
+    print(f"  stream cap   : {len(cap_sites)} site(s) -> {max_retries}")
+    print(f"  retry interval: {ms}ms")
 
     if dry_run:
+        print()
         print("CHECK ONLY - no changes were made.")
         return
 
     backup = binary.with_name(binary.name + ".orig")
     if not backup.exists():
+        print()
         print(f"Creating backup: {backup}")
         shutil.copy2(binary, backup)
 
@@ -434,7 +469,9 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
         tmp.unlink(missing_ok=True)
         die("could not replace binary (is codex running, or lacking permission?). "
             "Close codex and retry.")
-    print("Patched successfully.")
+    print()
+    print(f"Patched successfully: {len(edits)} jitter site(s) + "
+          f"{len(cap_sites)} cap site(s).")
     print(f"Restore with: {Path(sys.executable).name} {Path(sys.argv[0]).name} --restore")
 
 
