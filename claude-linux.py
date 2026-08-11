@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-patch-retry-claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
+claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
   1. Remove the retry cap so CLAUDE_CODE_MAX_RETRIES=9999 works
   2. Replace exponential backoff with fixed 1s interval
   3. Patch the Anthropic SDK's built-in retry backoff
@@ -9,10 +9,10 @@ patch-retry-claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
 Linux/macOS-only build of patch-retry-claude. The byte patches are the minified
 JS text embedded in the binary and are identical on every platform; only binary
 discovery, the atomic write's exec bit, and the command hints are Unix-specific
-here. For Windows use patch-retry-claude-windows.py.
+here. For Windows use claude-windows.py.
 
 Usage:
-  sudo python3 patch-retry-claude-linux.py [--check] [--restore]
+  sudo python3 claude-linux.py [--check] [--restore]
 
 Options:
   --check     Show what would be changed without modifying the binary
@@ -49,7 +49,7 @@ def require_platform() -> None:
     if os.name != "posix":
         print(f"ERROR: this is the Linux/macOS build, but the current OS is "
               f"'{sys.platform}' (os.name={os.name!r}).", file=sys.stderr)
-        print("Use patch-retry-claude-windows.py on Windows.", file=sys.stderr)
+        print("Use claude-windows.py on Windows.", file=sys.stderr)
         sys.exit(1)
 
 

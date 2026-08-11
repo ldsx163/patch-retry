@@ -6,8 +6,8 @@
 
 | 工具 | Linux / macOS | Windows |
 |---|---|---|
-| codex | `patch-codex-retry-linux.py` | `patch-codex-retry-windows.py` |
-| claude | `patch-retry-claude-linux.py` | `patch-retry-claude-windows.py` |
+| codex | `codex-linux.py` | `codex-windows.py` |
+| claude | `claude-linux.py` | `claude-windows.py` |
 
 - codex 两版处理**真实机器码差异**：Linux 走 ELF/Mach-O 文件偏移空间；Windows 走 PE 的 VA 换算（`build_pe_off2va`）。两版都支持 `addsd` / `movsd [0.9]` 双锚点。
 - claude 两版补丁本体（内嵌 JS 文本）**逐字节相同**，差异仅在二进制发现、写文件、命令提示。
@@ -16,25 +16,25 @@
 
 ## codex
 
-### Linux / macOS — `patch-codex-retry-linux.py`
+### Linux / macOS — `codex-linux.py`
 
 ```bash
 # 1. 预览（不修改）
-python3 patch-codex-retry-linux.py --check
+python3 codex-linux.py --check
 
 # 2. 打补丁：退避固定 1s + stream_max_retries 上限抬到 9999
-python3 patch-codex-retry-linux.py
+python3 codex-linux.py
 
 # 3. 还原
-python3 patch-codex-retry-linux.py --restore
+python3 codex-linux.py --restore
 ```
 
-### Windows — `patch-codex-retry-windows.py`
+### Windows — `codex-windows.py`
 
 ```powershell
-py patch-codex-retry-windows.py --check      # 预览
-py patch-codex-retry-windows.py              # 打补丁
-py patch-codex-retry-windows.py --restore    # 还原
+py codex-windows.py --check      # 预览
+py codex-windows.py              # 打补丁
+py codex-windows.py --restore    # 还原
 ```
 
 > 重试间隔与 stream 上限已固定为脚本内常量 `RETRY_MS = 1000`(毫秒)、
@@ -78,21 +78,21 @@ request_max_retries = 10
 
 ## claude
 
-### Linux / macOS — `patch-retry-claude-linux.py`
+### Linux / macOS — `claude-linux.py`
 
 ```bash
-python3 patch-retry-claude-linux.py --check       # 预览
-python3 patch-retry-claude-linux.py               # 打补丁
-python3 patch-retry-claude-linux.py --restore     # 还原
+python3 claude-linux.py --check       # 预览
+python3 claude-linux.py               # 打补丁
+python3 claude-linux.py --restore     # 还原
 ```
 
-### Windows — `patch-retry-claude-windows.py`
+### Windows — `claude-windows.py`
 
 ```powershell
 # 需先关闭正在运行的 claude.exe（Windows 会锁定运行中的可执行文件）
-py patch-retry-claude-windows.py --check
-py patch-retry-claude-windows.py
-py patch-retry-claude-windows.py --restore
+py claude-windows.py --check
+py claude-windows.py
+py claude-windows.py --restore
 ```
 
 打补丁后设置环境变量再运行 claude：
@@ -119,8 +119,8 @@ $env:CLAUDE_CODE_MAX_RETRIES="9999"            # Windows (PowerShell)
 
 ```bash
 # 1. 一键还原（推荐，靠 .orig 备份）
-python3 patch-codex-retry-linux.py --restore
-python3 patch-retry-claude-linux.py --restore
+python3 codex-linux.py --restore
+python3 claude-linux.py --restore
 
 # 2. 手动从 .orig 拷回（脚本本身跑不了时）
 cp <binary>.orig <binary> && chmod 755 <binary>
