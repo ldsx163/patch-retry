@@ -51,7 +51,7 @@ stream_max_retries/request_max_retries for the count (site 3 just unclamps the
 stream cap so values >100 take effect).
 
 Usage:
-  python3 codex-linux.py --check     (inspect only)
+  python3 codex-linux.py --dry-run   (inspect only)
   sudo python3 codex-linux.py        (apply the patch)
   python3 codex-linux.py --restore
   python3 codex-linux.py --self-test
@@ -444,7 +444,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
 
     if dry_run:
         print()
-        print("CHECK ONLY - no changes were made.")
+        print("DRY RUN - no changes were made.")
         return
 
     backup = binary.with_name(binary.name + ".orig")
@@ -547,7 +547,7 @@ def main() -> None:
         description="Patch Codex native binary retry backoff interval "
                     "(Linux/macOS ELF/Mach-O, x86-64)")
     parser.add_argument("--binary", help="path to native codex binary")
-    parser.add_argument("--check", action="store_true", help="inspect only; do not write or back up")
+    parser.add_argument("--dry-run", action="store_true", help="inspect only; do not write or back up")
     parser.add_argument("--restore", action="store_true", help="restore binary from .orig backup")
     parser.add_argument("--self-test", action="store_true", help="run small internal checks")
     args = parser.parse_args()
@@ -561,7 +561,7 @@ def main() -> None:
     if args.restore:
         restore_binary(binary)
     else:
-        patch_binary(binary, RETRY_MS, STREAM_MAX_RETRIES, args.check)
+        patch_binary(binary, RETRY_MS, STREAM_MAX_RETRIES, args.dry_run)
 
 
 if __name__ == "__main__":
