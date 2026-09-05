@@ -185,7 +185,7 @@ def parse_number(raw: bytes) -> float | None:
         return None
 
 
-def find_unique(data: bytes, pattern: bytes, what: str):
+def find_unique(data: bytes, pattern: bytes, what: str, warn_on_zero: bool = True):
     """Return the single match of `pattern`, or None (with a diagnostic).
 
     Uniqueness is a load-bearing part of every detector here: a shape that
@@ -193,10 +193,17 @@ def find_unique(data: bytes, pattern: bytes, what: str):
     the first hit would silently patch the wrong place -- which is exactly how
     an earlier version of this script ended up rewriting an unrelated OAuth
     helper. Refusing is the correct outcome.
+
+    Pass ``warn_on_zero=False`` when a zero-hit outcome is expected -- i.e.
+    detectors that first try the unpatched shape and then fall through to a
+    "(patched)" shape: on an already-patched binary the unpatched lookups
+    match zero times by design. Two or more hits still warn either way.
     """
     hits = list(re.finditer(pattern, data))
     if len(hits) == 1:
         return hits[0]
+    if len(hits) == 0 and not warn_on_zero:
+        return None
     print(f"  WARN: {what}: expected 1 structural match, found {len(hits)}",
           file=sys.stderr)
     return None
@@ -594,7 +601,7 @@ def discover_retry_after_ms_parser(data: bytes) -> tuple[bytes | None, dict | No
         rb'function (' + _IDENT + rb')\((' + _IDENT + rb')\)\{let (' + _IDENT + rb')='
         + _IDENT + rb'\(\2\);if\(\3\)\{let (' + _IDENT + rb')=parseInt\(\3,10\);'
         + rb'if\(!isNaN\(\4\)\)(return \4\*1000)\}return null\}',
-        "Retry-After milliseconds parser",
+        "Retry-After milliseconds parser", warn_on_zero=False,
     )
     if m is not None:
         old = m.group(5)
@@ -634,7 +641,7 @@ def discover_ratelimit_reset(data: bytes) -> dict | None:
         data,
         rb'get(?:\?\.)?\("anthropic-ratelimit-unified-reset"\);(if\(!(' + _IDENT
         + rb')\))return null',
-        "ratelimit-unified-reset guard",
+        "ratelimit-unified-reset guard", warn_on_zero=False,
     )
     if m is not None:
         old = m.group(1)
@@ -713,7 +720,7 @@ def discover_sdk_retry_after(data: bytes) -> list[dict]:
         rb'retryRequest\((?:' + _IDENT + rb',){3}' + _IDENT + rb'\)\{let ' + _IDENT
         + rb',(' + _IDENT + rb')=' + _IDENT + rb'(?:\?\.)?get\("retry-after-ms"\);'
         + rb'(if\(\1\))\{',
-        "SDK retry-after-ms guard",
+        "SDK retry-after-ms guard", warn_on_zero=False,
     )
     if ms is not None:
         old = ms.group(2)
@@ -728,7 +735,7 @@ def discover_sdk_retry_after(data: bytes) -> list[dict]:
         data,
         rb'let (' + _IDENT + rb')=' + _IDENT + rb'(?:\?\.)?get\("retry-after"\);'
         rb'(if\(\1&&!(' + _IDENT + rb')\))\{let ' + _IDENT + rb'=parseFloat\(\1\)',
-        "SDK retry-after guard",
+        "SDK retry-after guard", warn_on_zero=False,
     )
     if ra is not None:
         old = ra.group(2)
