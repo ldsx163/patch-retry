@@ -46,9 +46,45 @@ the inlined `unwrap_or(5).min(100)` codegen is byte-identical, so the same tail
 signature locates every inlined copy and we rewrite the cap immediate to
 STREAM_MAX_RETRIES so a large stream_max_retries in config.toml is honored.
 
+Sites 1-2 alone do NOT give a fixed interval, because two other delay sources in
+core/src/responses_retry.rs outrank or bypass `backoff()` entirely:
+
+  4. `let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));`
+     A server-supplied Retry-After wins and `backoff()` is never called, so the
+     wait becomes whatever the endpoint asked for. `Option<Duration>` is niche-
+     encoded (nanos == 1_000_000_000 means None), so the branch reads:
+         cmp  <r32>, 0x3b9aca00   ; None?
+         jne  <skip the backoff call>
+         ...  arg setup ...
+         call <core::util::backoff>
+     NOP-ing the `jne` makes the fixed backoff unconditional. Accepted only when
+     the call provably lands inside a patched site-2 function, which is what
+     stops a look-alike Option<Duration> unwrap from ever being rewritten.
+
+  5. The `unbounded_connection_retries` ladder (Stable, default ON): on a
+     ConnectionFailed the delay is a separate field that starts at
+     `Duration::from_secs(5)` and doubles up to `from_secs(60)`. Those are plain
+     whole-second constants, not `from_millis(f64 * jitter)`, so the sites 1-2
+     anchors cannot see them. Rewriting the *load* pins the delay no matter what
+     the ladder stored -- killing the 5s start and the doubling in one edit:
+         mov <secs64>, [<base>+0x10]   ->   mov <secs32>, <whole seconds>
+         mov <nanos32>,[<base>+0x18]   ->   xor <nanos32>, <nanos32>
+     Both forms are exactly 7 bytes, so the stores of that pair into the async
+     state machine (which is what identifies the sequence) stay in place. Site 5
+     can only express whole seconds; RETRY_MS is rounded up to >=1s for it.
+
+DESIGN RULE -- this patcher only ever changes "how long to wait after a failure
+has already been declared". It must never change what counts as a failure, nor
+how long detection takes (stream_idle_timeout_ms and friends are config, not
+patch targets). Any site added later has to satisfy that; see README.md.
+
 This changes the retry *interval*, not the retry *count*; use config.toml's
 stream_max_retries/request_max_retries for the count (site 3 just unclamps the
 stream cap so values >100 take effect).
+
+Site 4 makes codex ignore Retry-After, so a genuine quota wall is retried every
+second instead of when the server said to come back. That is the point of the
+patch, but do not point it at an endpoint that will penalize the hammering.
 
 Usage:
   python3 codex-linux.py --dry-run   (inspect only)
@@ -87,6 +123,27 @@ FROM_MILLIS_MAGIC = bytes.fromhex("cff753e3a59bc420")  # 0x20c49ba5e353f7cf, LE
 
 # `mov <reg32>, imm32` opcode base; the low 3 bits select the register.
 MOV_R32_IMM = 0xB8
+
+# Site 4: `Option<Duration>` is niche-encoded -- nanos == 1_000_000_000 is None.
+# (Duration::nanos is validity-restricted to 0..=999_999_999, so std reuses 1e9.)
+NICHE_NONE = struct.pack("<I", 1_000_000_000)
+
+# Same-length NOP runs, used to retire a `jne` without moving anything.
+NOP_RUNS = {2: b"\x66\x90", 6: b"\x66\x0f\x1f\x44\x00\x00"}
+
+# How far past a backoff entry a patched jitter site may sit for site 4 to accept
+# the call as "this really is core::util::backoff" (its body is ~0x160 bytes).
+BACKOFF_FN_WINDOW = 0x600
+
+# Site 4: bytes of arg setup tolerated between the `jne` and the backoff `call`,
+# and how far past the call the `jne` may land (the Some-path convergence).
+SITE4_CALL_WINDOW = 24
+SITE4_JOIN_WINDOW = 32
+
+# Site 5 circuit breaker: 0.153.4 has exactly two copies of the ladder (sampling
+# and remote-compaction). A much larger count means the signature went loose, and
+# site 5 rewrites live instructions, so refuse rather than guess.
+MAX_CONN_SITES = 4
 
 # 32-bit GP register names by 4-bit register number (for readable logs).
 REG_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
@@ -145,6 +202,56 @@ def detect_format(data: bytes) -> str:
 def validate_ms(ms: int) -> None:
     if not (MS_MIN <= ms <= MS_MAX):
         die(f"--ms must be between {MS_MIN} and {MS_MAX}")
+
+
+# ── Offset <-> VA maps (only site 4 needs them) ────────────────────────────────
+def load_segments(data: bytes, fmt: str) -> list[tuple[int, int, int]]:
+    """[(file_off, vaddr, file_size)] for every mapped segment.
+
+    Sites 1-3 compare RIP operands that land in the same single mapping, so they
+    stay in file-offset space. Site 4 has to *dereference* a GOT slot in the
+    writable segment, where `p_offset != p_vaddr` (a 0x1000 skew on this build),
+    so it needs a real translation in both directions."""
+    segs: list[tuple[int, int, int]] = []
+    if fmt == "elf":
+        phoff = struct.unpack_from("<Q", data, 0x20)[0]
+        phentsize = struct.unpack_from("<H", data, 0x36)[0]
+        phnum = struct.unpack_from("<H", data, 0x38)[0]
+        for i in range(phnum):
+            b = phoff + i * phentsize
+            if struct.unpack_from("<I", data, b)[0] == 1:  # PT_LOAD
+                off, va = struct.unpack_from("<QQ", data, b + 8)
+                filesz = struct.unpack_from("<Q", data, b + 32)[0]
+                segs.append((off, va, filesz))
+    elif fmt == "macho":
+        ncmds = struct.unpack_from("<I", data, 16)[0]
+        p = 32
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from("<II", data, p)
+            if cmdsize <= 0:
+                break
+            if cmd == 0x19:  # LC_SEGMENT_64
+                va, _vmsize, off, filesz = struct.unpack_from("<QQQQ", data, p + 24)
+                segs.append((off, va, filesz))
+            p += cmdsize
+    return segs
+
+
+def segment_maps(segs: list[tuple[int, int, int]]):
+    """(off2va, va2off); each returns None for an address outside every segment."""
+    def off2va(off: int):
+        for so, sv, ss in segs:
+            if so <= off < so + ss:
+                return off - so + sv
+        return None
+
+    def va2off(va: int):
+        for so, sv, ss in segs:
+            if sv <= va < sv + ss:
+                return va - sv + so
+        return None
+
+    return off2va, va2off
 
 
 # ── Sites 1 & 2: in-place jitter -> fixed interval ────────────────────────────
@@ -278,6 +385,199 @@ def make_jitter_patch(reg: int, region_len: int, ms: int) -> bytes:
     prefix = b"\x41" if reg >= 8 else b""
     patch = prefix + bytes([MOV_R32_IMM + (reg & 7)]) + struct.pack("<i", ms)
     return patch + b"\x90" * (region_len - len(patch))
+
+
+# ── Site 4 (Retry-After overriding the fixed backoff) ─────────────────────────
+def _call_target_off(data: bytes, off: int, off2va, va2off):
+    """File offset of the function a `call` at `off` reaches, or None.
+
+    Handles `e8 rel32` (direct) and `ff 15 disp32` (indirect through a GOT slot,
+    which is what this build emits for cross-codegen-unit calls)."""
+    va = off2va(off)
+    if va is None:
+        return None
+    if data[off] == 0xE8:
+        target = va + 5 + struct.unpack_from("<i", data, off + 1)[0]
+        return va2off(target)
+    if data[off] == 0xFF and data[off + 1] == 0x15:
+        slot = va2off(va + 6 + struct.unpack_from("<i", data, off + 2)[0])
+        if slot is None or slot + 8 > len(data):
+            return None
+        return va2off(struct.unpack_from("<Q", data, slot)[0])
+    return None
+
+
+def _call_len(data: bytes, off: int):
+    if data[off] == 0xE8:
+        return 5
+    if data[off] == 0xFF and data[off + 1] == 0x15:
+        return 6
+    return None
+
+
+def _backoff_call_after(data: bytes, start: int, in_backoff, limit: int):
+    """(call_off, call_len) of the first call to core::util::backoff within
+    `limit` bytes of `start`, or None."""
+    for i in range(start, min(start + limit, len(data) - 6)):
+        n = _call_len(data, i)
+        if n is None:
+            continue
+        target = _call_target_off(data, i, *in_backoff[1:])
+        if target is not None and in_backoff[0](target):
+            return i, n
+    return None
+
+
+def find_retry_after_sites(data: bytes, jitter_sites: list[dict],
+                           off2va, va2off) -> list[dict]:
+    """Offsets of the `err.retry_delay().unwrap_or_else(|| backoff(n))` branch.
+
+        cmp  <r32>, 0x3b9aca00   ; Option<Duration> niche: 1e9 == None
+        jne  <past the backoff call>
+        ...  arg setup ...
+        call <core::util::backoff>
+
+    A site is accepted only when the call target encloses one of the jitter sites
+    patched by sites 1-2, i.e. it provably is `backoff`. That check -- not the
+    byte pattern -- is what makes NOP-ing the `jne` safe."""
+    entries = [s["region_start"] for s in jitter_sites]
+    in_backoff = (lambda p: any(p <= r < p + BACKOFF_FN_WINDOW for r in entries),
+                  off2va, va2off)
+    out: list[dict] = []
+    i = data.find(NICHE_NONE)
+    while i != -1:
+        # cmp r32,imm32: `81 /7 imm32` (modrm f8..ff) or the eax short form `3d`.
+        cmp_off = None
+        if i >= 2 and data[i - 2] == 0x81 and 0xF8 <= data[i - 1] <= 0xFF:
+            cmp_off, reg = i - 2, data[i - 1] & 7
+        elif i >= 1 and data[i - 1] == 0x3D:
+            cmp_off, reg = i - 1, 0
+        if cmp_off is not None:
+            site = _classify_retry_after(data, cmp_off, i + 4, reg, in_backoff)
+            if site is not None:
+                out.append(site)
+        i = data.find(NICHE_NONE, i + 1)
+    return out
+
+
+def _classify_retry_after(data: bytes, cmp_off: int, after_cmp: int, reg: int,
+                          in_backoff) -> dict | None:
+    """Match the `jne`-or-already-NOPed form at `after_cmp`; None if neither."""
+    for length, patched in ((2, False), (6, False), (2, True), (6, True)):
+        blob = data[after_cmp : after_cmp + length]
+        if patched:
+            if blob != NOP_RUNS[length]:
+                continue
+            join = None
+        elif length == 2:
+            if data[after_cmp] != 0x75:
+                continue
+            join = after_cmp + 2 + struct.unpack_from("<b", data, after_cmp + 1)[0]
+        else:
+            if data[after_cmp : after_cmp + 2] != b"\x0f\x85":
+                continue
+            join = after_cmp + 6 + struct.unpack_from("<i", data, after_cmp + 2)[0]
+        found = _backoff_call_after(data, after_cmp + length, in_backoff,
+                                    SITE4_CALL_WINDOW)
+        if found is None:
+            continue
+        call_off, call_len = found
+        call_end = call_off + call_len
+        # The branch must jump *over* the backoff call and rejoin just past it.
+        if join is not None and not (call_end <= join <= call_end + SITE4_JOIN_WINDOW):
+            continue
+        return {"cmp": cmp_off, "reg": reg, "jne": after_cmp, "len": length,
+                "call": call_off, "patched": patched}
+    return None
+
+
+# ── Site 5 (unbounded connection-retry ladder: 5s doubling to 60s) ────────────
+def _conn_tail_ok(data: bytes, off: int, secs_reg: int, nanos_reg: int) -> bool:
+    """True when `off` holds the tail that identifies the delay load:
+
+        mov [<base>+disp32], <secs64>    ; spill the Duration into the
+        mov [<base>+disp32], <nanos32>   ;   async poll state machine
+        lea <r64>, [rip+disp32]          ; static-level check of the warn! that
+                                         ;   reports the wait
+
+    The rip-relative `lea` is load-bearing: unrelated code also spills a
+    {secs,nanos} pair into a state machine (a stray `mov eax,60 ; xor ecx,ecx`
+    reads exactly like an already-patched site), and that code continues with
+    base-relative `lea`s instead."""
+    if data[off : off + 2] != b"\x48\x89":
+        return False
+    m1 = data[off + 2]
+    if (m1 >> 6) != 0b10 or ((m1 >> 3) & 7) != secs_reg or (m1 & 7) == 0b100:
+        return False
+    q = off + 7  # 48 89 <modrm> <disp32>
+    if data[q] != 0x89:
+        return False
+    m2 = data[q + 1]
+    if not ((m2 >> 6) == 0b10 and ((m2 >> 3) & 7) == nanos_reg
+            and (m2 & 7) == (m1 & 7)):
+        return False
+    lea = q + 6  # 89 <modrm> <disp32>
+    return (data[lea] in (0x48, 0x4C) and data[lea + 1] == 0x8D
+            and (data[lea + 2] & 0xC7) == 0x05)
+
+
+def find_conn_delay_sites(data: bytes) -> list[dict]:
+    """Offsets of `let retry_delay = retry_state.connection_retry_delay;`.
+
+        mov <secs64>, [<base>+0x10]     (48 8b /r, mod=01, disp8=0x10)
+        mov <nanos32>,[<base>+0x18]     (8b /r,    mod=01, disp8=0x18)
+
+    The absent REX means both destination registers are already < 8, which is
+    what lets the 7-byte replacement fit exactly. Also recognizes the patched
+    form so --dry-run reports the current value instead of "not found"."""
+    out: list[dict] = []
+    i = data.find(b"\x48\x8b")
+    while i != -1:
+        m1 = data[i + 2]
+        if (m1 >> 6) == 0b01 and (m1 & 7) != 0b100 and data[i + 3] == 0x10:
+            secs, base = (m1 >> 3) & 7, m1 & 7
+            m2 = data[i + 5]
+            if (data[i + 4] == 0x8B and (m2 >> 6) == 0b01 and (m2 & 7) == base
+                    and data[i + 6] == 0x18 and base != secs
+                    and _conn_tail_ok(data, i + 7, secs, (m2 >> 3) & 7)):
+                out.append({"off": i, "secs_reg": secs, "nanos_reg": (m2 >> 3) & 7,
+                            "base_reg": base, "current": None})
+        i = data.find(b"\x48\x8b", i + 1)
+    out.extend(_find_patched_conn_delay_sites(data))
+    return sorted(out, key=lambda s: s["off"])
+
+
+def _find_patched_conn_delay_sites(data: bytes) -> list[dict]:
+    """Already-patched form: `mov <secs32>,imm32 ; xor <nanos32>,<nanos32>`."""
+    out: list[dict] = []
+    i = data.find(b"\x31", 5)
+    while i != -1:
+        modrm = data[i + 1]
+        reg = (modrm >> 3) & 7
+        if modrm == (0xC0 | (reg << 3) | reg) and 0xB8 <= data[i - 5] <= 0xBF:
+            secs = data[i - 5] - MOV_R32_IMM
+            if _conn_tail_ok(data, i + 2, secs, reg):
+                out.append({"off": i - 5, "secs_reg": secs, "nanos_reg": reg,
+                            "base_reg": None,
+                            "current": struct.unpack_from("<I", data, i - 4)[0]})
+        i = data.find(b"\x31", i + 1)
+    return out
+
+
+def make_conn_delay_patch(secs_reg: int, nanos_reg: int, secs: int) -> bytes:
+    """`mov <secs32>, secs ; xor <nanos32>, <nanos32>` -- exactly 7 bytes, the
+    length of the two loads it replaces, so nothing downstream shifts."""
+    if not (0 <= secs_reg < 8 and 0 <= nanos_reg < 8):
+        die("site 5 needs both registers below r8 to fit in 7 bytes")
+    patch = (bytes([MOV_R32_IMM + secs_reg]) + struct.pack("<I", secs)
+             + bytes([0x31, 0xC0 | (nanos_reg << 3) | nanos_reg]))
+    assert len(patch) == 7, patch.hex(" ")
+    return patch
+
+
+def conn_delay_secs(ms: int) -> int:
+    """Site 5 stores a whole-second Duration, so round RETRY_MS up to >= 1s."""
+    return max(1, round(ms / 1000))
 
 
 # ── Site 3 (stream_max_retries cap) ───────────────────────────────────────────
@@ -435,11 +735,62 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     else:
         print("  NOT FOUND - skipping (cap stays 100)")
 
+    # -- Site 4: Retry-After outranking the fixed backoff ---------------------
+    print()
+    print("=== Retry-After override (responses_retry.rs: unwrap_or_else) ===")
+    off2va, va2off = segment_maps(load_segments(bytes(data), fmt))
+    ra_sites = find_retry_after_sites(bytes(data), [s for _, s in report],
+                                      off2va, va2off)
+    for idx, s in enumerate(ra_sites, 1):
+        state = "already NOPed" if s["patched"] else "live"
+        print(f"  [{idx}] cmp {reg_name(s['reg'])},0x3b9aca00 @ 0x{s['cmp']:x}"
+              f"  (Option<Duration> None niche)")
+        print(f"        branch  : {s['len']}-byte jne @ 0x{s['jne']:x} -> {state}")
+        print(f"        verified: call @ 0x{s['call']:x} lands in a patched "
+              f"util.rs::backoff")
+        print(f"        rewrite : jne -> {s['len']}-byte NOP "
+              f"(server Retry-After ignored, backoff always wins)")
+    if not ra_sites:
+        print("  NOT FOUND - skipping (a server Retry-After will still override "
+              f"the {ms}ms interval)")
+    for s in ra_sites:
+        if not s["patched"]:
+            edits.append((s["jne"], NOP_RUNS[s["len"]]))
+
+    # -- Site 5: unbounded connection-retry ladder (5s -> 60s) ----------------
+    secs = conn_delay_secs(ms)
+    print()
+    print("=== connection retry ladder (unbounded_connection_retries) ===")
+    conn_sites = find_conn_delay_sites(bytes(data))
+    if len(conn_sites) > MAX_CONN_SITES:
+        print(f"  {len(conn_sites)} site(s) matched but at most {MAX_CONN_SITES} "
+              f"are plausible - REFUSING to patch site 5 (signature went loose)")
+        conn_sites = []
+    for idx, s in enumerate(conn_sites, 1):
+        cur = "unpatched (5s start, doubling to 60s)" if s["current"] is None \
+            else f"{s['current']}s fixed"
+        print(f"  [{idx}] delay load @ 0x{s['off']:x}  "
+              f"secs={reg_name(s['secs_reg'])} nanos={reg_name(s['nanos_reg'])}")
+        print(f"        current : {cur} -> {secs}s")
+        print(f"        rewrite : 7B -> mov {reg_name(s['secs_reg'])},{secs} ; "
+              f"xor {reg_name(s['nanos_reg'])},{reg_name(s['nanos_reg'])}")
+    if not conn_sites:
+        print("  NOT FOUND - skipping (set unbounded_connection_retries = false "
+              "in config.toml instead)")
+    if secs * 1000 != ms:
+        print(f"  NOTE: site 5 stores whole seconds, so {ms}ms is applied as {secs}s")
+    for s in conn_sites:
+        if s["current"] != secs:
+            edits.append((s["off"], make_conn_delay_patch(
+                s["secs_reg"], s["nanos_reg"], secs)))
+
     # -- Summary --------------------------------------------------------------
     print()
     print("=== Summary ===")
     print(f"  jitter sites : {len(report)} to patch -> {ms}ms fixed interval")
     print(f"  stream cap   : {len(cap_sites)} site(s) -> {max_retries}")
+    print(f"  retry-after  : {len(ra_sites)} site(s) -> ignored")
+    print(f"  conn ladder  : {len(conn_sites)} site(s) -> {secs}s flat")
     print(f"  retry interval: {ms}ms")
 
     if dry_run:
@@ -470,8 +821,9 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
         die("could not replace binary (is codex running, or lacking permission?). "
             "Close codex and retry.")
     print()
-    print(f"Patched successfully: {len(edits)} jitter site(s) + "
-          f"{len(cap_sites)} cap site(s).")
+    print(f"Patched successfully: {len(report)} jitter + {len(ra_sites)} "
+          f"retry-after + {len(conn_sites)} conn-ladder + {len(cap_sites)} cap "
+          f"site(s) ({len(edits)} edit(s) written).")
     print(f"Restore with: {Path(sys.executable).name} {Path(sys.argv[0]).name} --restore")
 
 
@@ -531,6 +883,8 @@ def self_test() -> None:
     magic = unrelated.find(FROM_MILLIS_MAGIC)
     unrelated[magic:magic + len(FROM_MILLIS_MAGIC)] = b"\x00" * len(FROM_MILLIS_MAGIC)
     assert find_jitter_sites(bytes(unrelated)) == []
+    _self_test_site4()
+    _self_test_site5()
     # format detection: ELF accepted, PE rejected via die()/SystemExit.
     assert detect_format(b"\x7fELF" + b"\x00" * 14 + b"\x3e\x00" + b"\x00" * 8) == "elf"
     try:
@@ -542,12 +896,91 @@ def self_test() -> None:
     print("self-test OK")
 
 
+def _self_test_site4() -> None:
+    """Synthetic `err.retry_delay().unwrap_or_else(|| backoff(n))` branch:
+        cmp ecx,1e9 ; jne +0x0b ; mov rdi,rcx ; call F ; <3B join pad>
+    with identity off<->VA maps (a real image needs segment_maps)."""
+    ident = lambda x: x
+    F = 0x100                                   # pretend backoff entry
+    C = 0x400                                   # the cmp
+    blob = bytearray(b"\x90" * 0x600)
+    body = (b"\x81\xf9" + NICHE_NONE            # cmp ecx, 1_000_000_000
+            + b"\x75\x0b"                       # jne  -> C+0x13
+            + b"\x48\x89\xcf"                   # mov rdi,rcx
+            + b"\xe8" + struct.pack("<i", F - (C + 16)))
+    blob[C : C + len(body)] = body
+    assert bytes(blob).count(NICHE_NONE) == 1
+    jitter = [{"region_start": F + 0x10}]       # sits inside the "function"
+    sites = find_retry_after_sites(bytes(blob), jitter, ident, ident)
+    assert len(sites) == 1, sites
+    s = sites[0]
+    assert (s["cmp"], s["jne"], s["len"], s["reg"]) == (C, C + 6, 2, 1), s
+    assert s["patched"] is False and s["call"] == C + 11
+    # a call that does not land in a patched backoff must be rejected outright
+    far = bytearray(blob)
+    assert find_retry_after_sites(bytes(far), [{"region_start": F + 0x900}],
+                                  ident, ident) == []
+    # the indirect form this build actually emits: `call [rip+GOT]`, where the
+    # slot holds the backoff entry (identity maps still exercise both hops).
+    G = 0x300
+    ind = bytearray(b"\x90" * 0x600)
+    ind[G : G + 8] = struct.pack("<Q", F)
+    indirect = (b"\x81\xf9" + NICHE_NONE      # cmp ecx, 1_000_000_000
+                + b"\x75\x0c"                 # jne  -> C+0x14
+                + b"\x48\x89\xcf"              # mov rdi,rcx
+                + b"\xff\x15" + struct.pack("<i", G - (C + 17)))
+    ind[C : C + len(indirect)] = indirect
+    via_got = find_retry_after_sites(bytes(ind), jitter, ident, ident)
+    assert len(via_got) == 1, via_got
+    assert via_got[0]["call"] == C + 11 and via_got[0]["patched"] is False
+    # apply and confirm the NOPed form is still recognized (idempotency)
+    patched = bytearray(blob)
+    patched[s["jne"] : s["jne"] + 2] = NOP_RUNS[2]
+    again = find_retry_after_sites(bytes(patched), jitter, ident, ident)
+    assert len(again) == 1 and again[0]["patched"] is True, again
+
+
+def _self_test_site5() -> None:
+    """Synthetic connection-delay load plus the tail that identifies it."""
+    load = b"\x48\x8b\x48\x10" + b"\x8b\x40\x18"          # rcx <- secs, eax <- nanos
+    tail = (b"\x48\x89\x8b" + struct.pack("<i", 0x1b8)     # mov [rbx+0x1b8],rcx
+            + b"\x89\x83" + struct.pack("<i", 0x1c0)       # mov [rbx+0x1c0],eax
+            + b"\x48\x8d\x05" + struct.pack("<i", 0x40))   # lea rax,[rip+0x40]
+    at = 0x40
+    blob = bytearray(b"\x00" * at + load + tail + b"\x00" * 0x40)
+    sites = find_conn_delay_sites(bytes(blob))
+    assert len(sites) == 1, sites
+    s = sites[0]
+    assert (s["off"], s["secs_reg"], s["nanos_reg"], s["base_reg"]) == (at, 1, 0, 0), s
+    assert s["current"] is None
+    patch = make_conn_delay_patch(s["secs_reg"], s["nanos_reg"], 1)
+    assert patch == b"\xb9\x01\x00\x00\x00\x31\xc0", patch.hex(" ")
+    assert len(patch) == len(load)
+    patched = bytearray(blob)
+    patched[at : at + len(patch)] = patch
+    s2 = find_conn_delay_sites(bytes(patched))
+    assert len(s2) == 1 and s2[0]["current"] == 1 and s2[0]["off"] == at, s2
+    # the load pair alone is not enough: without the paired tail it is skipped
+    lone = bytearray(b"\x00" * at + load + b"\x00" * 0x40)
+    assert find_conn_delay_sites(bytes(lone)) == []
+    # unrelated `mov eax,60 ; xor ecx,ecx` spilling a Duration reads like an
+    # already-patched site until the rip-relative lea is required.
+    decoy = (b"\xb8\x3c\x00\x00\x00\x31\xc9"
+             + b"\x48\x89\x83" + struct.pack("<i", 0x508)
+             + b"\x89\x8b" + struct.pack("<i", 0x510)
+             + b"\x4c\x8d\xb3" + struct.pack("<i", 0x518))  # lea r14,[rbx+..]
+    assert find_conn_delay_sites(b"\x00" * at + decoy + b"\x00" * 0x40) == []
+    assert conn_delay_secs(1000) == 1 and conn_delay_secs(1) == 1
+    assert conn_delay_secs(2400) == 2
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Patch Codex native binary retry backoff interval "
                     "(Linux/macOS ELF/Mach-O, x86-64)")
     parser.add_argument("--binary", help="path to native codex binary")
-    parser.add_argument("--dry-run", action="store_true", help="inspect only; do not write or back up")
+    parser.add_argument("--dry-run", "--check", dest="dry_run", action="store_true",
+                        help="inspect only; do not write or back up")
     parser.add_argument("--restore", action="store_true", help="restore binary from .orig backup")
     parser.add_argument("--self-test", action="store_true", help="run small internal checks")
     args = parser.parse_args()
