@@ -6,6 +6,7 @@ claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
   3. Patch the Anthropic SDK's built-in retry backoff
   4. Lower rate-limit fallback delays
   5. Ignore Retry-After / ratelimit-reset so 429s also wait ~1s
+  6. Pin the API retry loop's delay to 1000ms at the assignment
 
 Linux/macOS-only build of patch-retry-claude. The byte patches are the minified
 JS text embedded in the binary and are identical on every platform; only binary
@@ -26,10 +27,17 @@ Environment variables (after patching):
   CLAUDE_CODE_RETRY_WATCHDOG=1      - Persistent 429/overloaded retry (lifts the 15 cap)
   BUN_JSC_forceDebuggerBytecodeGeneration=1 - Recompile patched source in Bun
 
-Version-agnostic: This script dynamically discovers minified variable names
-by searching for code structure patterns (e.g. "clamped to ${VAR}" near
-"CLAUDE_CODE_MAX_RETRIES") rather than hardcoding variable names. This
-allows it to work across versions where minification produces different names.
+Every patch site is located by CODE SHAPE, never by a minified identifier or a
+magic number. Bundler-generated names (`rle`, `xEf`, `wEf`, ...) change on every
+release; the structure around them does not. So each detector matches a
+skeleton -- "a function whose first parameter is the attempt counter and whose
+body starts with Math.min(BASE*Math.pow(2,attempt-1), CAP)" -- and reads the
+names and the numbers out of the match rather than hardcoding them. Names in
+docstrings below are only "what it was called in the build this was written
+against", never something the code depends on.
+
+Every detector is also required to be UNIQUE: if a shape matches zero or more
+than one place, the patch is skipped with a diagnostic instead of guessing.
 """
 
 import argparse
@@ -41,6 +49,20 @@ import sys
 
 PROC_NAME = "claude"
 STOP_HINT = "Stop it first."
+
+# Every retry delay this script writes, in milliseconds.
+TARGET_DELAY_MS = 1000
+# Retry-After values below this are slept verbatim; raising it means a header
+# we failed to neutralize still costs seconds rather than the 10min fallback.
+RATE_LIMIT_THRESHOLD_MS = 99999
+
+_IDENT = rb'[a-zA-Z_$][a-zA-Z0-9_$]*'
+# A JS numeric literal, including the exponential forms this script writes back
+# (`1e3`), so a re-read of an already-patched site parses instead of missing.
+_NUMBER = rb'[0-9][0-9.eE+]*'
+# "not preceded by an identifier character" -- keeps `VAR=` from matching the
+# tail of a longer name such as `myVAR=`.
+_NOT_IDENT = rb'(?<![A-Za-z0-9_$])'
 
 
 def require_platform() -> None:
@@ -139,439 +161,678 @@ def find_binary() -> str:
     sys.exit(1)
 
 
-def find_all(data: bytes, pattern: bytes) -> list[int]:
-    """Find all offsets of a byte pattern in data."""
-    offsets = []
-    start = 0
-    while True:
-        idx = data.find(pattern, start)
-        if idx == -1:
-            break
-        offsets.append(idx)
-        start = idx + 1
-    return offsets
+# --- Same-length rewriting helpers -------------------------------------------
+# Every patch must keep the file size identical, so a replacement is always the
+# same byte length as what it overwrites. Numbers get an exponential form or
+# trailing spaces; JS accepts whitespace anywhere an operator or comma follows.
 
+def fit_literal(candidates: list[str], width: int) -> bytes | None:
+    """First candidate that fits `width`, right-padded with spaces.
 
-def find_nearest(data: bytes, pattern: bytes, ref_offset: int, max_dist: int) -> int | None:
-    """Find the offset of pattern closest to ref_offset, within max_dist.
-
-    max_dist is inclusive and must be > 0; it is a required argument because a
-    zero window can never match and would silently look like "pattern absent".
+    Do NOT pad numbers with leading zeros: `0010000` is a legacy octal literal
+    in sloppy-mode JS (= 4096, not 10000) and a SyntaxError under strict/ESM.
     """
-    if max_dist <= 0:
-        raise ValueError(f"max_dist must be > 0 (got {max_dist})")
-    best = None
-    best_dist = max_dist
-    for off in find_all(data, pattern):
-        dist = abs(off - ref_offset)
-        if dist <= best_dist:
-            best_dist = dist
-            best = off
-    return best
+    for c in candidates:
+        if len(c) <= width:
+            return (c + " " * (width - len(c))).encode()
+    return None
 
 
-def apply_byte_patch(data: bytearray, desc: str, search: bytes, replace: bytes,
-                     stats: dict, hint_offset: int | None = None,
-                     max_dist: int | None = None) -> bytearray:
-    """Apply a single search->replace byte patch. Returns modified data.
+def js_number(value: int, width: int) -> bytes | None:
+    """Render `value` as a JS numeric literal occupying exactly `width` bytes.
 
-    If hint_offset is provided, finds the search pattern nearest to that offset
-    within max_dist (which is then required). Otherwise, uses the first
-    occurrence.
+    Prefers plain decimal; falls back to the shortest exponential form when the
+    slot is too narrow (500 -> 1e3 keeps a 3-byte slot).
     """
-    if len(search) != len(replace):
-        print(f"  SKIP: {desc} - byte length mismatch ({len(search)} vs {len(replace)})", file=sys.stderr)
+    s = str(value)
+    trailing_zeros = len(s) - len(s.rstrip("0"))
+    exponential = sorted(
+        (f"{s[:len(s) - k]}e{k}" for k in range(1, trailing_zeros + 1)),
+        key=len,
+    )
+    return fit_literal([s] + exponential, width)
+
+
+def parse_number(raw: bytes) -> float | None:
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def find_unique(data: bytes, pattern: bytes, what: str):
+    """Return the single match of `pattern`, or None (with a diagnostic).
+
+    Uniqueness is a load-bearing part of every detector here: a shape that
+    suddenly matches twice means the assumption behind it broke, and picking
+    the first hit would silently patch the wrong place -- which is exactly how
+    an earlier version of this script ended up rewriting an unrelated OAuth
+    helper. Refusing is the correct outcome.
+    """
+    hits = list(re.finditer(pattern, data))
+    if len(hits) == 1:
+        return hits[0]
+    print(f"  WARN: {what}: expected 1 structural match, found {len(hits)}",
+          file=sys.stderr)
+    return None
+
+
+# --- Site model ---------------------------------------------------------------
+# A "site" is one same-length byte rewrite at a known absolute offset, produced
+# by a structural detector that has already verified what is there. Discovery
+# and application are separate so --dry-run can report exactly what would be
+# written without a second, differently-shaped code path.
+
+def site(key: str, desc: str, offset: int, old: bytes, new: bytes) -> dict:
+    return {"key": key, "desc": desc, "offset": offset, "old": old, "new": new,
+            "state": "todo"}
+
+
+def site_done(key: str, desc: str) -> dict:
+    return {"key": key, "desc": desc, "offset": None, "old": None, "new": None,
+            "state": "done"}
+
+
+def apply_site(data: bytearray, s: dict, stats: dict) -> None:
+    """Write one site into `data`, or account for it as already applied."""
+    if s["state"] == "done":
+        print(f"  OK {s['desc']} (already patched)")
+        stats["applied"] += 1
+        return
+    off, old, new = s["offset"], s["old"], s["new"]
+    if len(old) != len(new):
+        print(f"  SKIP: {s['desc']} - byte length mismatch "
+              f"({len(old)} vs {len(new)})", file=sys.stderr)
         stats["failed"] += 1
-        return data
-
-    if hint_offset is not None and not max_dist:
-        raise ValueError(f"max_dist is required when hint_offset is given ({desc})")
-
-    def _already():
-        if hint_offset is not None:
-            return find_nearest(data, replace, hint_offset, max_dist)
-        hits = find_all(data, replace)
-        return hits[0] if hits else None
-
-    if hint_offset is not None:
-        offset = find_nearest(data, search, hint_offset, max_dist)
-        if offset is None:
-            already = _already()
-            if already is not None:
-                print(f"  OK {desc} @ offset {already} (already patched)")
-                stats["applied"] += 1
-                return data
-            print(f"  WARN: Could not find pattern near hint for: {desc}", file=sys.stderr)
-            stats["failed"] += 1
-            return data
-    else:
-        offsets = find_all(data, search)
-        if not offsets:
-            already = _already()
-            if already is not None:
-                print(f"  OK {desc} @ offset {already} (already patched)")
-                stats["applied"] += 1
-                return data
-            print(f"  WARN: Could not find pattern for: {desc}", file=sys.stderr)
-            stats["failed"] += 1
-            return data
-        offset = offsets[0]
-
-    # Verify the bytes at the offset match
-    actual = data[offset:offset + len(search)]
-    if actual != search:
-        print(f"  SKIP: {desc} - byte mismatch at offset {offset}", file=sys.stderr)
-        print(f"    Expected: {search.hex()}", file=sys.stderr)
-        print(f"    Actual:   {actual.hex()}", file=sys.stderr)
+        s["state"] = "failed"
+        return
+    actual = bytes(data[off:off + len(old)])
+    if actual != old:
+        print(f"  SKIP: {s['desc']} - byte mismatch at offset {off}", file=sys.stderr)
+        print(f"    Expected: {old!r}", file=sys.stderr)
+        print(f"    Actual:   {actual!r}", file=sys.stderr)
         stats["failed"] += 1
-        return data
-
-    print(f"  OK {desc} @ offset {offset}")
-    data[offset:offset + len(replace)] = replace
+        s["state"] = "failed"
+        return
+    print(f"  OK {s['desc']} @ offset {off}")
+    print(f"       {old.decode('utf-8', 'replace')}")
+    print(f"    -> {new.decode('utf-8', 'replace')}")
+    data[off:off + len(new)] = new
     stats["applied"] += 1
-    return data
+    s["state"] = "applied"
 
 
-# --- Dynamic pattern discovery ------------------------------------------------
-# These functions discover minified variable names by searching for code
-# structure patterns that are stable across versions (the logic stays the
-# same even as minifier output changes variable names).
+# --- Detector 1: retry cap ----------------------------------------------------
 
-def discover_retry_cap(data: bytes) -> tuple[int, bytes] | None:
-    """Locate the retry cap warning and its cap variable in one pass.
+def discover_retry_cap(data: bytes) -> tuple[str, dict | None]:
+    """Decide whether CLAUDE_CODE_MAX_RETRIES is clamped, and neutralize it.
 
-    The code contains:
-        `CLAUDE_CODE_MAX_RETRIES=${e} clamped to ${VARNAME}`
-    where VARNAME is the cap variable used by the clamp we disable.
+    Two shapes exist in the wild:
 
-    Returns (warning_offset, cap_var). Every other cap lookup must anchor to
-    THIS offset: picking the warning independently with data.find() would take
-    the first occurrence even when a later one is the real clamp site, so two
-    helpers could silently work on different sites once a build mentions the
-    env var more than once.
+    a) clamped -- the env value is compared against a cap and a warning
+       `CLAUDE_CODE_MAX_RETRIES=${n} clamped to ${CAP}` is emitted. The guard
+       `if(PARSED>CAP&&...` is rewritten to `if(!1 ...` so the clamp branch
+       is dead and the raw value passes through.
+
+    b) uncapped -- the reader returns the parsed value directly. Current builds
+       look like this, so there is nothing to disable. That is VERIFIED, not
+       assumed: the reader body is matched in full and checked for the absence
+       of a clamp, so a cap reintroduced in a future build cannot be silently
+       reported as "fine".
+
+    Returns (status, site) with status in {"clamped", "uncapped", "unknown"}.
     """
+    # (a) A clamp that announces itself.
     for m in re.finditer(rb'CLAUDE_CODE_MAX_RETRIES=\$\{', data):
         ctx = data[m.start():m.start() + 200]
-        clamped = re.search(rb'clamped to \$\{([a-zA-Z_$][a-zA-Z0-9_$]*)\}', ctx)
-        if clamped:
-            return m.start(), clamped.group(1)
+        clamped = re.search(rb'clamped to \$\{(' + _IDENT + rb')\}', ctx)
+        if not clamped:
+            continue
+        cap_var = clamped.group(1)
+        before = data[max(0, m.start() - 200):m.start()]
+        guard = re.search(rb'if\((' + _IDENT + rb'>' + re.escape(cap_var) + rb')\)&&', before)
+        guard = guard or re.search(
+            rb'if\((' + _IDENT + rb'>' + re.escape(cap_var) + rb')&&', before)
+        if guard:
+            off = max(0, m.start() - 200) + guard.start(1)
+            old = guard.group(1)
+            new = fit_literal(["!1"], len(old))
+            return "clamped", site(
+                "max_retries",
+                f"Disable retry cap clamp against {cap_var.decode()}",
+                off, old, new)
+        if re.search(rb'if\(!1 *&&', before):
+            return "clamped", site_done("max_retries", "Disable retry cap clamp")
+        return "unknown", None
+
+    # (b) No warning anywhere: prove the reader is genuinely uncapped.
+    reader = find_unique(
+        data,
+        rb'function (' + _IDENT + rb')\(\)\{if\(process\.env\.CLAUDE_CODE_MAX_RETRIES\)'
+        rb'\{let (' + _IDENT + rb')=parseInt\(process\.env\.CLAUDE_CODE_MAX_RETRIES,10\);'
+        rb'([^{}]{0,160})\}return (' + _IDENT + rb')\}',
+        "CLAUDE_CODE_MAX_RETRIES reader",
+    )
+    if reader is None:
+        return "unknown", None
+    body = reader.group(3)
+    if b"Math.min" in body or b"Math.max" in body:
+        print("  WARN: the env reader clamps the value in a shape this script "
+              "does not recognize; refusing to guess", file=sys.stderr)
+        return "unknown", None
+    return "uncapped", site_done(
+        "max_retries",
+        f"Retry cap: none in this build ({reader.group(1).decode()} returns "
+        f"CLAUDE_CODE_MAX_RETRIES unclamped)")
+
+
+# --- Detector 2: the API retry backoff helper --------------------------------
+
+def discover_backoff_fn(data: bytes) -> dict | None:
+    """Locate the API retry backoff helper by shape, not by name.
+
+    The skeleton (minified as `rle` in the build this was written against):
+
+        function NAME(attempt, retryAfter, cap = 32000) {
+            let d = Math.min(BASE * Math.pow(2, attempt - 1), cap),
+                jitter = d + Math.random() * 0.25 * d;
+            if (retryAfter) {
+                let s = parseInt(retryAfter, 10);
+                if (!isNaN(s)) return Math.max(s * 1000, jitter)   // header wins
+            }
+            return jitter
+        }
+
+    Three things identify it and nothing else in the binary satisfies all
+    three: the min() over an exponential in the function's OWN first parameter,
+    a `Math.random()` jitter term right after it, and the enclosing `function`
+    header whose first parameter is that same attempt counter. Nine other
+    `Math.pow(2,n-1)` backoffs exist in the binary (MCP reconnect, OAuth
+    refresh, session persistence, ...) and every one of them is rejected.
+
+    Returns {name, body_start, base, pow, header} or None.
+    """
+    candidates = []
+    for m in re.finditer(
+        rb'Math\.min\((?:(' + _IDENT + rb')|(' + _NUMBER + rb'))'
+        rb'\*Math\.pow\(([12]),(' + _IDENT + rb')-1\),', data
+    ):
+        attempt = m.group(4)
+        # The jitter term must follow within the same statement.
+        if not re.match(rb'[^;]{0,80}?Math\.random\(\)', data[m.end():m.end() + 120]):
+            continue
+        window_start = max(0, m.start() - 400)
+        header = None
+        for f in re.finditer(rb'function (' + _IDENT + rb')\((' + _IDENT + rb')',
+                             data[window_start:m.start()]):
+            header = f
+        if header is None or header.group(2) != attempt:
+            continue
+        candidates.append((window_start + header.start(), header.group(1), m))
+
+    if len(candidates) != 1:
+        print(f"  WARN: API retry backoff helper: expected 1 structural match, "
+              f"found {len(candidates)}", file=sys.stderr)
+        return None
+
+    body_start, name, m = candidates[0]
+    info = {"name": name, "body_start": body_start, "pow": None,
+            "base": None, "header": None}
+
+    # -- base: `Math.pow` multiplier, either a shared const or an inline literal
+    if m.group(1) is not None:
+        base_var = m.group(1)
+        decl = find_unique(
+            data, _NOT_IDENT + re.escape(base_var) + rb'=(' + _NUMBER + rb')',
+            f"backoff base declaration {base_var.decode()}")
+        if decl is not None:
+            info["base"] = {"var": base_var, "offset": decl.start(1),
+                            "raw": decl.group(1)}
+    else:
+        info["base"] = {"var": None, "offset": m.start(2), "raw": m.group(2)}
+
+    # -- exponent base: 2 (exponential growth) or 1 (already flattened)
+    info["pow"] = {"offset": m.start(3), "raw": m.group(3)}
+
+    # -- Retry-After override inside the same body
+    body = data[body_start:body_start + 600]
+    hdr = re.search(rb'return Math\.max\((' + _IDENT + rb')\*1000,(' + _IDENT + rb')\)', body)
+    if hdr:
+        info["header"] = {"offset": body_start + hdr.start(), "raw": hdr.group(0),
+                          "jitter": hdr.group(2), "patched": False}
+    else:
+        # Patched shape: the Math.max is gone and the jitter is returned bare.
+        done = re.search(rb'if\(!isNaN\((' + _IDENT + rb')\)\)return (' + _IDENT
+                         + rb') {2,}\}return \2', body)
+        if done:
+            info["header"] = {"patched": True}
+    return info
+
+
+def backoff_sites(data: bytes, fn: dict) -> list[dict]:
+    """Turn a discovered backoff helper into concrete rewrites."""
+    sites = []
+
+    base = fn["base"]
+    if base is None:
+        print("  WARN: backoff base literal not resolved", file=sys.stderr)
+    else:
+        current = parse_number(base["raw"])
+        where = (f"const {base['var'].decode()}" if base["var"]
+                 else f"inline literal in {fn['name'].decode()}()")
+        if current == TARGET_DELAY_MS:
+            sites.append(site_done("backoff_base", f"Backoff base already {TARGET_DELAY_MS}ms ({where})"))
+        else:
+            new = js_number(TARGET_DELAY_MS, len(base["raw"]))
+            if new is None:
+                print(f"  WARN: cannot fit {TARGET_DELAY_MS} into the "
+                      f"{len(base['raw'])}-byte backoff base slot", file=sys.stderr)
+            else:
+                sites.append(site(
+                    "backoff_base",
+                    f"Backoff base {base['raw'].decode()} -> {TARGET_DELAY_MS}ms ({where})",
+                    base["offset"], base["raw"], new))
+
+    pw = fn["pow"]
+    if pw["raw"] == b"1":
+        sites.append(site_done("backoff_pow", "Exponential growth already disabled (pow base 1)"))
+    else:
+        sites.append(site(
+            "backoff_pow",
+            "Disable exponential growth (pow base 2 -> 1; pow(1,n) is always 1)",
+            pw["offset"], pw["raw"], b"1"))
+
+    hdr = fn["header"]
+    if hdr is None:
+        print("  WARN: Retry-After override inside the backoff helper not found",
+              file=sys.stderr)
+    elif hdr.get("patched"):
+        sites.append(site_done("retry_after_backoff",
+                               "Retry-After already ignored in the backoff helper"))
+    else:
+        old = hdr["raw"]
+        new = fit_literal(["return " + hdr["jitter"].decode()], len(old))
+        sites.append(site(
+            "retry_after_backoff",
+            "Ignore Retry-After in the backoff helper (return the ~1s jitter, "
+            "not the header's seconds)",
+            hdr["offset"], old, new))
+    return sites
+
+
+# --- Detector 3: pin the retry loop's delay assignments ----------------------
+
+def discover_delay_pins(data: bytes, fn_name: bytes) -> list[dict]:
+    """Pin every "how long until the next attempt" assignment to 1000ms.
+
+    Anchored on the retry telemetry event, which names the delay variable in
+    its own payload and so survives any renaming:
+
+        G("tengu_api_retry", { attempt: I, delayMs: x, ... })
+
+    Everything assigned to that variable just above -- in the build this was
+    written against:
+
+        x = resetHeaderMs(err) ?? Math.min(backoff(n, retryAfter, cap), ceil)
+        x = Math.min(backoff(n, retryAfter, cap), ceil)
+        x = backoff(attempt, retryAfter)
+
+    -- becomes a literal 1000. Rewriting the ASSIGNMENT rather than only the
+    backoff helper matters because of the `??`: a non-null reset header
+    short-circuits the helper entirely, so patching the helper alone leaves
+    that path waiting minutes.
+    """
+    anchor = find_unique(
+        data,
+        rb'"tengu_api_retry",\{attempt:' + _IDENT + rb',delayMs:(' + _IDENT + rb')[,}]',
+        "API retry telemetry (delay variable)",
+    )
+    if anchor is None:
+        return []
+    var = anchor.group(1)
+    lo = max(0, anchor.start() - 900)
+    region = data[lo:anchor.start()]
+
+    assign = (_NOT_IDENT + re.escape(var) + rb'=(?:' + _IDENT + rb'\(' + _IDENT
+              + rb'\)\?\?)?(?:Math\.min\()?' + re.escape(fn_name) + rb'\(' + _IDENT
+              + rb'(?:,' + _IDENT + rb')*\)(?:,' + _IDENT + rb'\))?')
+    pinned = _NOT_IDENT + re.escape(var) + re.escape(b"=%d" % TARGET_DELAY_MS) + rb' {2,}'
+
+    sites = []
+    for i, m in enumerate(re.finditer(assign, region), 1):
+        old = m.group(0)
+        new = fit_literal([f"{var.decode()}={TARGET_DELAY_MS}"], len(old))
+        if new is None:
+            print(f"  WARN: delay assignment {i} is too short to pin", file=sys.stderr)
+            continue
+        sites.append(site(
+            f"delay_pin_{i}",
+            f"Pin retry delay assignment {i} to {TARGET_DELAY_MS}ms",
+            lo + m.start(), old, new))
+    if sites:
+        return sites
+    for i, _ in enumerate(re.finditer(pinned, region), 1):
+        sites.append(site_done(f"delay_pin_{i}",
+                               f"Retry delay assignment {i} already pinned"))
+    if not sites:
+        print("  WARN: no retry delay assignment found near the telemetry anchor",
+              file=sys.stderr)
+    return sites
+
+
+# --- Detector 4: rate-limit fallback delays ----------------------------------
+
+def discover_rate_limit(data: bytes, ms_parser_name: bytes | None) -> list[dict]:
+    """Shorten the long-wait path taken when a 429 is not retried inline.
+
+        let ms = retryAfterMs(err);
+        if (ms !== null && ms < THRESHOLD) { await sleep(ms); continue }
+        let until = Math.max(ms ?? FALLBACK, MINIMUM)
+
+    FALLBACK (30min) and MINIMUM (10min) drop to 1s; THRESHOLD rises so a
+    header we failed to neutralize still costs seconds, not the 10min floor.
+    All three current values are read out of the binary and rewritten in
+    place -- nothing here searches for `=1800000`.
+    """
+    guard = find_unique(
+        data,
+        rb'let (' + _IDENT + rb')=(' + _IDENT + rb')\(' + _IDENT
+        + rb'\);if\(\1!==null&&\1<(' + _IDENT + rb')\)\{',
+        "rate-limit threshold guard",
+    )
+    fallback = find_unique(
+        data,
+        rb'\}let ' + _IDENT + rb'=Math\.max\((' + _IDENT + rb')\?\?(' + _IDENT
+        + rb'),(' + _IDENT + rb')\)',
+        "rate-limit fallback/minimum",
+    )
+    if guard is None or fallback is None:
+        return []
+    if guard.group(1) != fallback.group(1):
+        print("  WARN: rate-limit guard and fallback refer to different "
+              "variables; refusing to guess", file=sys.stderr)
+        return []
+    if ms_parser_name is not None and guard.group(2) != ms_parser_name:
+        print(f"  WARN: rate-limit guard reads {guard.group(2).decode()}, not the "
+              f"Retry-After parser {ms_parser_name.decode()}; refusing to guess",
+              file=sys.stderr)
+        return []
+
+    wanted = [
+        ("rl_threshold", guard.group(3), RATE_LIMIT_THRESHOLD_MS,
+         "Rate-limit inline-sleep threshold"),
+        ("rl_fallback", fallback.group(2), TARGET_DELAY_MS,
+         "Rate-limit fallback wait"),
+        ("rl_min", fallback.group(3), TARGET_DELAY_MS,
+         "Rate-limit minimum wait"),
+    ]
+    sites = []
+    for key, var, target, label in wanted:
+        decl = find_unique(data, _NOT_IDENT + re.escape(var) + rb'=(' + _NUMBER + rb')',
+                           f"{label} declaration {var.decode()}")
+        if decl is None:
+            continue
+        raw = decl.group(1)
+        current = parse_number(raw)
+        if current == target:
+            sites.append(site_done(key, f"{label} already {target}ms ({var.decode()})"))
+            continue
+        new = js_number(target, len(raw))
+        if new is None:
+            print(f"  WARN: cannot fit {target} into the {len(raw)}-byte "
+                  f"{var.decode()} slot", file=sys.stderr)
+            continue
+        sites.append(site(
+            key,
+            f"{label} {raw.decode()} -> {target}ms ({var.decode()})",
+            decl.start(1), raw, new))
+    return sites
+
+
+# --- Detector 5: Retry-After / ratelimit-reset parsers -----------------------
+
+def discover_retry_after_ms_parser(data: bytes) -> tuple[bytes | None, dict | None]:
+    """Stop the Retry-After header from being consumed as a sleep duration.
+
+        function NAME(err) {
+            let h = header(err);
+            if (h) { let s = parseInt(h, 10); if (!isNaN(s)) return s * 1000 }
+            return null
+        }
+
+    Forcing the `null` return sends the caller to the (now 1s) backoff path.
+    Returns (function name, site) -- the name is fed back into the rate-limit
+    detector so the two are proven to be the same code path.
+    """
+    m = find_unique(
+        data,
+        rb'function (' + _IDENT + rb')\((' + _IDENT + rb')\)\{let (' + _IDENT + rb')='
+        + _IDENT + rb'\(\2\);if\(\3\)\{let (' + _IDENT + rb')=parseInt\(\3,10\);'
+        + rb'if\(!isNaN\(\4\)\)(return \4\*1000)\}return null\}',
+        "Retry-After milliseconds parser",
+    )
+    if m is not None:
+        old = m.group(5)
+        new = fit_literal(["return null"], len(old))
+        if new is None:
+            return m.group(1), None
+        return m.group(1), site(
+            "retry_after_ms",
+            f"Ignore Retry-After in {m.group(1).decode()}() "
+            f"(return null instead of the header's seconds)",
+            m.start(5), old, new)
+
+    done = find_unique(
+        data,
+        rb'function (' + _IDENT + rb')\((' + _IDENT + rb')\)\{let (' + _IDENT + rb')='
+        + _IDENT + rb'\(\2\);if\(\3\)\{let (' + _IDENT + rb')=parseInt\(\3,10\);'
+        + rb'if\(!isNaN\(\4\)\)return null +\}return null\}',
+        "Retry-After milliseconds parser (patched)",
+    )
+    if done is not None:
+        return done.group(1), site_done(
+            "retry_after_ms", "Retry-After already ignored in the ms parser")
+    return None, None
+
+
+def discover_ratelimit_reset(data: bytes) -> dict | None:
+    """Stop `anthropic-ratelimit-unified-reset` from setting the retry delay.
+
+        let t = headers.get?.("anthropic-ratelimit-unified-reset");
+        if (!t) return null
+
+    The header NAME is a wire protocol string, not a minified identifier, so
+    matching on it is stable across builds. Forcing `if(!0)` takes the null
+    branch and falls through to the ~1s backoff.
+    """
+    m = find_unique(
+        data,
+        rb'get(?:\?\.)?\("anthropic-ratelimit-unified-reset"\);(if\(!(' + _IDENT
+        + rb')\))return null',
+        "ratelimit-unified-reset guard",
+    )
+    if m is not None:
+        old = m.group(1)
+        new = fit_literal(["if(!0)"], len(old))
+        if new is None:
+            return None
+        return site(
+            "ratelimit_reset",
+            "Ignore anthropic-ratelimit-unified-reset (take the null branch)",
+            m.start(1), old, new)
+    if re.search(rb'get(?:\?\.)?\("anthropic-ratelimit-unified-reset"\);if\(!0\)', data):
+        return site_done("ratelimit_reset",
+                         "anthropic-ratelimit-unified-reset already ignored")
     return None
 
 
-def discover_retry_cap_clamp(data: bytes, warn_offset: int, cap_var: bytes) -> bytes | None:
-    """Discover the actual clamp comparison expression, e.g. b't>gaa'.
+# --- Detector 6: the bundled Anthropic SDK -----------------------------------
+# The SDK is bundled from TypeScript source with its class methods intact, so
+# `retryRequest` / `calculateDefaultRetryTimeoutMillis` are real API names, not
+# minifier output -- stable anchors. Only the locals inside are minified.
 
-    The parse variable in `if(PARSE>CAP&&...` differs across minifier runs
-    (older builds used `e`, newer ones `t`), so we can't hardcode it. Locate
-    the `if(<name><CAP>&&` guard just before the clamp warning at warn_offset
-    and return the full `<name>><CAP>` slice so callers can neutralize it with
-    a same-length always-false replacement.
+def discover_sdk_backoff(data: bytes) -> dict | None:
+    """SDK: `Math.min(0.5*Math.pow(2,n), 8)` seconds -> a flat ~1s.
+
+        calculateDefaultRetryTimeoutMillis(e, t) {
+            let n = t - e, s = Math.min(0.5 * Math.pow(2, n), 8),
+                jitter = 1 - Math.random() * 0.25;
+            return s * jitter * 1000
+        }
+
+    Setting the coefficient to 1 and the exponent base to 1 leaves
+    1 * (0.75..1) * 1000 ms.
     """
-    before = data[max(0, warn_offset - 200):warn_offset]
-    m = re.search(rb'if\((' + rb'[a-zA-Z_$][a-zA-Z0-9_$]*' + rb'>' + re.escape(cap_var) + rb')&&', before)
-    if m:
-        return m.group(1)
-    return None
-
-
-def discover_backoff_base_var(data: bytes) -> bytes | None:
-    """Discover the backoff base variable name from the retry delay formula.
-
-    Older builds contain:
-        Math.min(VARNAME*Math.pow(2,e-1),n)
-    where VARNAME=500 is the base delay in ms.
-
-    Newer builds inline the literal (`500*Math.pow(2,e-1)`); that path does not
-    use this helper.
-    """
-    for m in re.finditer(rb'Math\.min\(([a-zA-Z_$][a-zA-Z0-9_$]*)\*Math\.pow\(2,e-1\)', data):
-        return m.group(1)
-    return None
-
-
-def discover_sdk_backoff(data: bytes) -> tuple[bytes, bytes] | None:
-    """SDK retry: `0.5*Math.pow(2,IDENT)` -> `1.0*Math.pow(1,IDENT)`.
-
-    IDENT used to be `o`; newer SDK minifies it to `n`.
-    """
-    m = re.search(rb'0\.5\*Math\.pow\(2,([a-zA-Z_$][a-zA-Z0-9_$]*)\)', data)
-    if not m:
-        return None
-    ident = m.group(1)
-    return (b"0.5*Math.pow(2," + ident + b")",
-            b"1.0*Math.pow(1," + ident + b")")
-
-
-def retry_cap_already_disabled(data: bytes, warn_offset: int) -> bool:
-    """True if the clamp guard at warn_offset is already `if(!1 ...)`."""
-    before = data[max(0, warn_offset - 200):warn_offset]
-    return re.search(rb'if\(!1 *&&', before) is not None
-
-
-def backoff_already_patched(data: bytes) -> bool:
-    """True if Patch 2 is already applied.
-
-    Both routes -- the inlined literal (`1e3*Math.pow(1,e-1)`) and the older
-    two-step (`VAR=1e3` plus `Math.pow(1,e-1)`) -- leave `Math.pow(1,e-1)`
-    behind, which never appears in unpatched code.
-    """
-    return b"Math.pow(1,e-1)" in data
-
-
-def sdk_backoff_already_patched(data: bytes) -> bool:
-    """True if Patch 3 is already applied (`1.0*Math.pow(1,IDENT)`)."""
-    return re.search(rb'1\.0\*Math\.pow\(1,[a-zA-Z_$][a-zA-Z0-9_$]*\)', data) is not None
-
-
-def discover_rate_limit_vars(data: bytes) -> tuple[bytes | None, bytes | None, bytes | None]:
-    """Discover rate-limit variable names from the rate-limit handling code.
-
-    The code always contains:
-        RETRY_VAR!==null&&RETRY_VAR<THRESHOLD_VAR
-        Math.max(RETRY_VAR??FALLBACK_VAR,MIN_VAR)
-    near the string "rate_limit".
-
-    Returns (fallback_var, min_var, threshold_var) or Nones.
-    """
-    fallback_var = None
-    min_var = None
-    threshold_var = None
-
-    idx = data.find(b'rate_limit')
-    while idx != -1:
-        before = data[max(0, idx - 500):idx]
-        if b'Math.max' in before:
-            # Extract Math.max(RETRY_VAR??FALLBACK_VAR,MIN_VAR)
-            name = rb'[a-zA-Z_$][a-zA-Z0-9_$]*'
-            m = re.search(rb'Math\.max\((' + name + rb')\?\?(' + name + rb'),(' + name + rb')\)', before)
-            if m:
-                retry_var = m.group(1)
-                fallback_var = m.group(2)
-                min_var = m.group(3)
-
-                # Extract RETRY_VAR!==null&&RETRY_VAR<THRESHOLD_VAR
-                m2 = re.search(re.escape(retry_var) + rb'!==null&&' + re.escape(retry_var) + rb'<(' + name + rb')', before)
-                if m2:
-                    threshold_var = m2.group(1)
-
-            if fallback_var and min_var and threshold_var:
-                return fallback_var, min_var, threshold_var
-
-        idx = data.find(b'rate_limit', idx + 1)
-
-    return fallback_var, min_var, threshold_var
-
-
-def legacy_rate_limit_fallback_present(data: bytes) -> bool:
-    """Return True for the previous 10s fallback patch that needs migration."""
-    fallback_var, _, _ = discover_rate_limit_vars(data)
-    return bool(fallback_var and fallback_var + b"=10000  " in data)
-
-
-_IDENT = rb'[a-zA-Z_$][a-zA-Z0-9_$]*'
-
-
-def discover_wb_retry_after_honor(data: bytes) -> tuple[bytes, bytes] | None:
-    """WB: `return Math.max(parsed*1000, jitter)` -> `return jitter` (padded).
-
-    After Patch 2 the exponential formula is already ~1s, but a Retry-After
-    header still wins via Math.max. Drop the header so the 1s jitter is used.
-    Unique in current builds (one hit).
-    """
-    m = re.search(rb'return Math\.max\((' + _IDENT + rb')\*1000,(' + _IDENT + rb')\)', data)
-    if not m:
-        return None
-    search = m.group(0)
-    jitter = m.group(2)
-    replace = b"return " + jitter + b" " * (len(search) - len(b"return ") - len(jitter))
-    if len(search) != len(replace):
-        return None
-    return search, replace
-
-
-def wb_retry_after_already_ignored(data: bytes) -> bool:
-    """True if WB no longer does Math.max(Retry-After-ms, jitter)."""
-    if re.search(rb'return Math\.max\(' + _IDENT + rb'\*1000,' + _IDENT + rb'\)', data):
-        return False
-    # Patched form: `if(!isNaN(u))return o                 }return o`
-    return re.search(
-        rb'if\(!isNaN\(' + _IDENT + rb'\)\)return ' + _IDENT + rb' {2,}\}return ',
+    m = find_unique(
         data,
-    ) is not None
-
-
-def discover_uko_retry_after_ms(data: bytes) -> tuple[bytes, bytes] | None:
-    """Uko: `return parsed*1000}return null` -> `return null  }return null`.
-
-    Non-watchdog 429 path sleeps this many ms directly. Force null so it
-    skips the header wait. Unique in current builds (one hit).
-    """
-    m = re.search(rb'return (' + _IDENT + rb')\*1000\}return null', data)
-    if not m:
-        return None
-    search = m.group(0)
-    parsed = m.group(1)
-    head = b"return " + parsed + b"*1000"
-    replace = b"return null" + b" " * (len(head) - len(b"return null")) + search[len(head):]
-    if len(search) != len(replace):
-        return None
-    return search, replace
-
-
-def uko_retry_after_already_ignored(data: bytes) -> bool:
-    """True if Uko no longer returns Retry-After as milliseconds."""
-    if re.search(rb'return ' + _IDENT + rb'\*1000\}return null', data):
-        return False
-    return re.search(
-        rb'if\(!isNaN\(' + _IDENT + rb'\)\)return null +\}return null',
-        data,
-    ) is not None
-
-
-def discover_hko_reset_null_guard(data: bytes) -> tuple[bytes, bytes] | None:
-    """Hko: `get?.("anthropic-ratelimit-unified-reset");if(!VAR)return null`.
-
-    Watchdog 429 prefers this reset-timestamp delay over WB. Force the null
-    branch (`if(!0)`) so it falls through to the 1s WB delay.
-    """
-    m = re.search(
-        rb'get\?\.\("anthropic-ratelimit-unified-reset"\);if\(!(' + _IDENT + rb')\)return null',
-        data,
+        rb'calculateDefaultRetryTimeoutMillis\(' + _IDENT + rb',' + _IDENT + rb'\)\{'
+        rb'let (' + _IDENT + rb')=' + _IDENT + rb'-' + _IDENT + rb',' + _IDENT
+        + rb'=Math\.min\((' + _NUMBER + rb')\*Math\.pow\(([12]),\1\),' + _NUMBER + rb'\)',
+        "SDK calculateDefaultRetryTimeoutMillis",
     )
-    if not m:
+    if m is None:
         return None
-    search = m.group(0)
-    var = m.group(1)
-    old = b"if(!" + var + b")"
-    new = b"if(!0)" + b" " * (len(var) - 1)
-    replace = search.replace(old, new, 1)
-    if len(search) != len(replace):
+    coeff_raw, pow_raw = m.group(2), m.group(3)
+    if parse_number(coeff_raw) == 1 and pow_raw == b"1":
+        return site_done("sdk", "SDK backoff already flat (~1s)")
+    old = data[m.start(2):m.end(3)]
+    coeff_new = fit_literal(["1.0", "1", "1e0"], len(coeff_raw))
+    if coeff_new is None:
         return None
-    return search, replace
+    new = coeff_new + old[len(coeff_raw):-1] + b"1"
+    return site(
+        "sdk",
+        f"SDK backoff {coeff_raw.decode()}*pow({pow_raw.decode()},n) -> "
+        f"{coeff_new.decode().strip()}*pow(1,n) (fixed ~0.75-1s)",
+        m.start(2), old, new)
 
 
-def hko_reset_already_ignored(data: bytes) -> bool:
-    """True if Hko always takes the null branch after reading unified-reset."""
-    return b'get?.("anthropic-ratelimit-unified-reset");if(!0)' in data
+def discover_sdk_retry_after(data: bytes) -> list[dict]:
+    """SDK retryRequest: skip both Retry-After headers.
 
+        async retryRequest(opts, left, logId, headers) {
+            let ms, a = headers?.get("retry-after-ms");
+            if (a) { ... ms = parseFloat(a) }
+            let b = headers?.get("retry-after");
+            if (b && !ms) { ... }
+            ...
+        }
 
-def discover_qpe_watchdog_delay(data: bytes) -> tuple[bytes, bytes] | None:
-    """QPe watchdog 429: `xt=(status===429?Hko(...):null)??Math.min(WB(...),cap)`.
-
-    Hko returns ms-until-unified-reset (minutes) and `??` keeps that value, so
-    Patch 5's WB/Hko edits never run. Hardcode `xt=1000` at the assignment.
+    Both guards are forced false so the SDK falls through to
+    calculateDefaultRetryTimeoutMillis, which the patch above pins to ~1s.
+    The header names are wire protocol strings, so they anchor reliably.
     """
-    m = re.search(
-        rb'xt=\(' + _IDENT + rb' instanceof \$t&&' + _IDENT
-        + rb'\.status===429\?' + _IDENT + rb'\(' + _IDENT
-        + rb'\):null\)\?\?Math\.min\(' + _IDENT + rb'\(' + _IDENT
-        + rb',' + _IDENT + rb',' + _IDENT + rb'\),' + _IDENT + rb'\)',
+    sites = []
+    ms = find_unique(
         data,
+        rb'retryRequest\((?:' + _IDENT + rb',){3}' + _IDENT + rb'\)\{let ' + _IDENT
+        + rb',(' + _IDENT + rb')=' + _IDENT + rb'(?:\?\.)?get\("retry-after-ms"\);'
+        + rb'(if\(\1\))\{',
+        "SDK retry-after-ms guard",
     )
-    if not m:
-        return None
-    search = m.group(0)
-    replace = b"xt=1000" + b" " * (len(search) - len(b"xt=1000"))
-    if len(search) != len(replace):
-        return None
-    return search, replace
+    if ms is not None:
+        old = ms.group(2)
+        new = fit_literal(["if(0)"], len(old))
+        if new is not None:
+            sites.append(site("sdk_ra_ms", "Ignore SDK retry-after-ms header",
+                              ms.start(2), old, new))
+    elif re.search(rb'get(?:\?\.)?\("retry-after-ms"\);if\(0\)', data):
+        sites.append(site_done("sdk_ra_ms", "SDK retry-after-ms already ignored"))
 
-
-def qpe_watchdog_delay_already_hardcoded(data: bytes) -> bool:
-    """True if the watchdog 429 assignment is already `xt=1000` plus padding."""
-    return re.search(rb'xt=1000 {8,}', data) is not None
-
-
-def discover_qpe_plain_delay(data: bytes) -> tuple[bytes, bytes] | None:
-    """Non-watchdog QPe: `xt=WB(attempt, retryAfter)` -> `xt=1000`."""
-    m = re.search(rb'xt=(' + _IDENT + rb')\((' + _IDENT + rb'),(' + _IDENT + rb')\)', data)
-    if not m:
-        return None
-    search = m.group(0)
-    replace = b"xt=1000" + b" " * (len(search) - len(b"xt=1000"))
-    if len(search) != len(replace):
-        return None
-    return search, replace
-
-
-def qpe_plain_delay_already_hardcoded(data: bytes) -> bool:
-    return re.search(rb'xt=1000 {2,},!rR\(\)', data) is not None
-
-
-def discover_sdk_retry_after_ms_guard(data: bytes) -> tuple[bytes, bytes] | None:
-    """SDK retryRequest: skip `retry-after-ms` (`if(header)` -> `if(0)`)."""
-    m = re.search(
-        rb'get\("retry-after-ms"\);if\((' + _IDENT + rb')\)\{let '
-        + _IDENT + rb'=parseFloat\(\1\)',
+    ra = find_unique(
         data,
+        rb'let (' + _IDENT + rb')=' + _IDENT + rb'(?:\?\.)?get\("retry-after"\);'
+        rb'(if\(\1&&!(' + _IDENT + rb')\))\{let ' + _IDENT + rb'=parseFloat\(\1\)',
+        "SDK retry-after guard",
     )
-    if not m:
-        return None
-    var = m.group(1)
-    search = b"if(" + var + b"){"
-    replace = b"if(0)" + b" " * (len(var) - 1) + b"{"
-    # Unique-ify with the get() prefix so we don't hit unrelated if(var){
-    full_search = b'get("retry-after-ms");' + search
-    full_replace = b'get("retry-after-ms");' + replace
-    if len(full_search) != len(full_replace):
-        return None
-    return full_search, full_replace
+    if ra is not None:
+        old = ra.group(2)
+        new = fit_literal([f"if(0&&!{ra.group(3).decode()})"], len(old))
+        if new is not None:
+            sites.append(site("sdk_ra", "Ignore SDK retry-after / HTTP-date header",
+                              ra.start(2), old, new))
+    elif re.search(rb'get(?:\?\.)?\("retry-after"\);if\(0&&', data):
+        sites.append(site_done("sdk_ra", "SDK retry-after already ignored"))
+    return sites
 
 
-def discover_sdk_retry_after_guard(data: bytes) -> tuple[bytes, bytes] | None:
-    """SDK retryRequest: skip `retry-after` / HTTP-date (`if(a&&!s)` -> `if(0&&!s)`)."""
-    m = re.search(
-        rb'get\("retry-after"\);if\((' + _IDENT + rb')&&!s\)\{let '
-        + _IDENT + rb'=parseFloat\(\1\)',
-        data,
-    )
-    if not m:
-        return None
-    var = m.group(1)
-    search = b"if(" + var + b"&&!s)"
-    replace = b"if(0" + b" " * (len(var) - 1) + b"&&!s)"
-    full_search = b'get("retry-after");' + search
-    full_replace = b'get("retry-after");' + replace
-    if len(full_search) != len(full_replace):
-        return None
-    return full_search, full_replace
+# --- Orchestration ------------------------------------------------------------
+
+def discover_all(data: bytes) -> list[dict]:
+    """Run every detector and return the full list of sites, in patch order."""
+    sites: list[dict] = []
+
+    print("=== Patch 1: Retry cap (CLAUDE_CODE_MAX_RETRIES) ===")
+    status, cap_site = discover_retry_cap(data)
+    if cap_site is not None:
+        sites.append(cap_site)
+        if status == "uncapped":
+            print(f"  {cap_site['desc']}")
+    else:
+        print("  SKIP: could not determine whether the retry cap is enforced",
+              file=sys.stderr)
+
+    print("=== Patch 2: Exponential backoff -> fixed 1s ===")
+    fn = discover_backoff_fn(data)
+    if fn is not None:
+        print(f"  backoff helper: {fn['name'].decode()}() @ {fn['body_start']}")
+        sites += backoff_sites(data, fn)
+    else:
+        print("  SKIP: API retry backoff helper not located", file=sys.stderr)
+
+    print("=== Patch 3: Bundled Anthropic SDK backoff ===")
+    sdk = discover_sdk_backoff(data)
+    if sdk is not None:
+        sites.append(sdk)
+    else:
+        print("  SKIP: SDK backoff not located", file=sys.stderr)
+
+    print("=== Patch 4: Retry-After / ratelimit-reset ===")
+    ms_name, ms_site = discover_retry_after_ms_parser(data)
+    if ms_site is not None:
+        sites.append(ms_site)
+    else:
+        print("  SKIP: Retry-After milliseconds parser not located", file=sys.stderr)
+    reset_site = discover_ratelimit_reset(data)
+    if reset_site is not None:
+        sites.append(reset_site)
+    else:
+        print("  SKIP: ratelimit-unified-reset guard not located", file=sys.stderr)
+    sdk_ra = discover_sdk_retry_after(data)
+    if len(sdk_ra) == 2:
+        sites += sdk_ra
+    else:
+        print(f"  SKIP: expected 2 SDK Retry-After guards, located {len(sdk_ra)}",
+              file=sys.stderr)
+
+    print("=== Patch 5: Rate-limit fallback delays ===")
+    rl = discover_rate_limit(data, ms_name)
+    if len(rl) == 3:
+        sites += rl
+    else:
+        print(f"  SKIP: expected 3 rate-limit constants, located {len(rl)}",
+              file=sys.stderr)
+
+    print("=== Patch 6: Pin the retry loop's delay to 1s ===")
+    if fn is not None:
+        pins = discover_delay_pins(data, fn["name"])
+        sites += pins
+        if pins:
+            print(f"  delay assignments: {len(pins)}")
+    else:
+        print("  SKIP: needs the backoff helper from Patch 2", file=sys.stderr)
+
+    return sites
 
 
-def sdk_retry_after_already_ignored(data: bytes) -> bool:
-    return (
-        b'get("retry-after-ms");if(0)' in data
-        and b'get("retry-after");if(0' in data
-    )
-
-
-def looks_already_patched(data: bytes) -> bool:
-    """Return True if the binary already contains this script's own edits.
-
-    These exact strings are *replacements* this script writes; they don't occur
-    in unpatched code (raising 1 to a power -- Math.pow(1,...) -- is pointless
-    real code).
+def looks_already_patched(sites: list[dict]) -> bool:
+    """True when every located site is already in its patched state.
 
     Patching again would be a no-op at best, so the write path refuses and asks
     for a --restore first. --dry-run is allowed through: it writes nothing, and
-    reporting the current per-patch state is exactly what it's for.
-
-    An older run of this script (backoff patched, Retry-After still honored)
-    must NOT count as fully patched: Patch 5 still needs to be written.
+    reporting the current per-site state is exactly what it is for.
     """
-    sentinels = (b"1.0*Math.pow(1,", b"Math.pow(1,e-1)")
-    if not any(s in data for s in sentinels):
-        return False
-    # Migrate the earlier version's 10s fallback instead of treating it as
-    # complete; the normal patch flow will replace it with the 1s value.
-    if legacy_rate_limit_fallback_present(data):
-        return False
-    return (
-        wb_retry_after_already_ignored(data)
-        and uko_retry_after_already_ignored(data)
-        and hko_reset_already_ignored(data)
-        and qpe_watchdog_delay_already_hardcoded(data)
-        and sdk_retry_after_already_ignored(data)
-    )
+    return bool(sites) and all(s["state"] == "done" for s in sites)
 
 
 def write_patched(binary_path: str, data: bytearray) -> None:
@@ -608,6 +869,44 @@ def write_patched(binary_path: str, data: bytearray) -> None:
         except OSError:
             pass
         raise
+
+
+def print_summary(sites: list[dict]) -> None:
+    """Report what each behavior actually ended up as."""
+    state = {}
+    for s in sites:
+        state.setdefault(s["key"], s["state"] in ("applied", "done"))
+
+    def row(setting, keys, patched_text):
+        flags = [state[k] for k in keys if k in state]
+        missing = len([k for k in keys if k not in state])
+        total = len(flags) + missing
+        done = sum(1 for f in flags if f)
+        if total == 0:
+            behavior = "not located"
+        elif done == total:
+            behavior = patched_text
+        elif done == 0:
+            behavior = "unchanged (patch skipped)"
+        else:
+            behavior = f"partially patched ({done}/{total})"
+        return f"  | {setting:<24}| {behavior:<33}|"
+
+    pin_keys = [k for k in state if k.startswith("delay_pin_")]
+    sep = "  +-------------------------+----------------------------------+"
+    print(sep)
+    print(f"  | {'Setting':<24}| {'Behavior':<33}|")
+    print(sep)
+    print(row("Max retries", ["max_retries"], "CLAUDE_CODE_MAX_RETRIES (=9999)"))
+    print(row("General retry delay", ["backoff_base", "backoff_pow"], "Fixed ~1 second"))
+    print(row("API retry loop delay", pin_keys or ["delay_pin_1"], "Pinned to 1000ms"))
+    print(row("Rate-limit retry delay",
+              ["rl_fallback", "rl_min", "rl_threshold"], "Fixed ~1 second"))
+    print(row("SDK-level retry delay", ["sdk"], "Fixed ~0.75-1 second"))
+    print(row("Retry-After / reset",
+              ["retry_after_backoff", "retry_after_ms", "ratelimit_reset",
+               "sdk_ra_ms", "sdk_ra"], "ignored (always ~1s)"))
+    print(sep)
 
 
 def main():
@@ -655,10 +954,16 @@ def main():
 
     require_unix_image(data, binary_path)
 
+    # -- Locate every site by structure ----------------------------------------
+    print()
+    print("=== Locating patch sites by code structure ===")
+    print()
+    sites = discover_all(bytes(data))
+
     # -- Already patched: refuse to write, but let --dry-run report the state ---
     # Checked before the backup so a patched binary is never copied over a good
     # .orig (--dry-run never reaches the backup step at all).
-    already_patched = looks_already_patched(data)
+    already_patched = looks_already_patched(sites)
     if already_patched:
         if not args.dry_run:
             print()
@@ -679,423 +984,13 @@ def main():
             print(f"Is {PROC_NAME} running? {STOP_HINT}", file=sys.stderr)
             sys.exit(1)
 
-    # -- Discover minified variable names dynamically --------------------------
+    # -- Apply -----------------------------------------------------------------
     print()
-    print("=== Discovering version-specific patterns ===")
-
-    cap_site = discover_retry_cap(data)
-    retry_cap_warn_offset, retry_cap_var = cap_site if cap_site else (None, None)
-    if retry_cap_var:
-        print(f"  Retry cap variable: {retry_cap_var.decode()} "
-              f"(clamp warning @ {retry_cap_warn_offset})")
-    else:
-        print("  WARN: Could not discover retry cap variable", file=sys.stderr)
-
-    backoff_literal = b"500*Math.pow(2,e-1)" in data
-    backoff_base_var = None if backoff_literal else discover_backoff_base_var(data)
-    backoff_done = backoff_already_patched(data)
-    if backoff_literal:
-        print("  Backoff formula: 500*Math.pow(2,e-1) (literal)")
-    elif backoff_base_var:
-        print(f"  Backoff base variable: {backoff_base_var.decode()}")
-    elif backoff_done:
-        print("  Backoff formula: already patched (Math.pow(1,e-1) present)")
-    else:
-        print("  WARN: Could not discover backoff base variable", file=sys.stderr)
-
-    sdk_pair = discover_sdk_backoff(data)
-    sdk_done = sdk_backoff_already_patched(data)
-    if sdk_pair:
-        print(f"  SDK backoff: {sdk_pair[0].decode()}")
-    elif sdk_done:
-        print("  SDK backoff: already patched (1.0*Math.pow(1,...) present)")
-    else:
-        print("  WARN: Could not discover SDK backoff", file=sys.stderr)
-
-    rl_fallback_var, rl_min_var, rl_threshold_var = discover_rate_limit_vars(data)
-    if rl_fallback_var:
-        print(f"  Rate-limit fallback variable: {rl_fallback_var.decode()}")
-    if rl_min_var:
-        print(f"  Rate-limit minimum variable: {rl_min_var.decode()}")
-    if rl_threshold_var:
-        print(f"  Rate-limit threshold variable: {rl_threshold_var.decode()}")
-    if not rl_fallback_var or not rl_min_var or not rl_threshold_var:
-        print("  WARN: Could not discover all rate-limit variables", file=sys.stderr)
-
-    wb_retry_after_pair = discover_wb_retry_after_honor(data)
-    uko_retry_after_pair = discover_uko_retry_after_ms(data)
-    hko_reset_pair = discover_hko_reset_null_guard(data)
-    if wb_retry_after_pair:
-        print("  Retry-After honor (WB): Math.max(header*1000, jitter)")
-    elif wb_retry_after_already_ignored(data):
-        print("  Retry-After honor (WB): already ignored")
-    else:
-        print("  WARN: Could not discover WB Retry-After honor", file=sys.stderr)
-    if uko_retry_after_pair:
-        print("  Retry-After ms (Uko): return parsed*1000")
-    elif uko_retry_after_already_ignored(data):
-        print("  Retry-After ms (Uko): already ignored")
-    else:
-        print("  WARN: Could not discover Uko Retry-After parser", file=sys.stderr)
-    if hko_reset_pair:
-        print("  ratelimit-reset (Hko): if(!var)return null")
-    elif hko_reset_already_ignored(data):
-        print("  ratelimit-reset (Hko): already ignored")
-    else:
-        print("  WARN: Could not discover Hko unified-reset guard", file=sys.stderr)
-
-    qpe_wd_pair = discover_qpe_watchdog_delay(data)
-    qpe_plain_pair = discover_qpe_plain_delay(data)
-    sdk_ms_pair = discover_sdk_retry_after_ms_guard(data)
-    sdk_ra_pair = discover_sdk_retry_after_guard(data)
-    if qpe_wd_pair:
-        print("  QPe watchdog 429 delay: Hko??WB(...)")
-    elif qpe_watchdog_delay_already_hardcoded(data):
-        print("  QPe watchdog 429 delay: already hardcoded 1000ms")
-    else:
-        print("  WARN: Could not discover QPe watchdog 429 delay assignment", file=sys.stderr)
-    if qpe_plain_pair:
-        print("  QPe plain delay: xt=WB(attempt, retryAfter)")
-    elif qpe_plain_delay_already_hardcoded(data):
-        print("  QPe plain delay: already hardcoded 1000ms")
-    else:
-        print("  WARN: Could not discover QPe plain delay assignment", file=sys.stderr)
-    if sdk_ms_pair and sdk_ra_pair:
-        print("  SDK retryRequest: honors retry-after / retry-after-ms")
-    elif sdk_retry_after_already_ignored(data):
-        print("  SDK retryRequest: already ignores Retry-After")
-    else:
-        print("  WARN: Could not discover SDK Retry-After guards", file=sys.stderr)
-
-    # -- Save hint offset for Math.pow patch before backoff base is overwritten --
-    backoff_base_hint_offset = None
-    if backoff_base_var:
-        search = backoff_base_var + b"=500"
-        hits = find_all(data, search)
-        if hits:
-            backoff_base_hint_offset = hits[0]
-            print(f"  Saved backoff base hint offset: {backoff_base_hint_offset}")
-
-    # -- Apply patches ---------------------------------------------------------
+    print("=== Applying patches ===")
     stats = {"applied": 0, "failed": 0}
-    # Per-patch success flags. These drive the final "Retry behavior" table so
-    # it reflects what was actually patched instead of a hardcoded description.
-    ok = {
-        "max_retries": False,   # Patch 1 -> Max retries row
-        "backoff_base": False,  # Patch 2 (base 500->1000)  -> General retry delay row
-        "backoff_pow": False,   # Patch 2 (pow 2->1)        -> General retry delay row
-        "sdk": False,           # Patch 3 -> SDK-level retry delay row
-        "rl_fallback": False,   # Patch 4 (fallback)  -> Rate-limit retry delay row
-        "rl_min": False,        # Patch 4 (minimum)   -> Rate-limit retry delay row
-        "rl_threshold": False,  # Patch 4 (threshold) -> Rate-limit retry delay row
-        "retry_after_wb": False,   # Patch 5 (WB Math.max) -> Retry-After row
-        "retry_after_uko": False,  # Patch 5 (Uko ms)      -> Retry-After row
-        "retry_after_hko": False,  # Patch 5 (Hko reset)   -> Retry-After row
-        "qpe_wd": False,           # Patch 6 (hardcode xt) -> call-site 1s
-        "qpe_plain": False,
-        "sdk_ra": False,
-    }
+    for s in sites:
+        apply_site(data, s, stats)
 
-    # -- Patch 1: Remove retry cap --------------------------------------------
-    print()
-    print("=== Patch 1: Remove retry cap ===")
-    if retry_cap_var:
-        clamp_expr = discover_retry_cap_clamp(data, retry_cap_warn_offset, retry_cap_var)
-        if clamp_expr:
-            # Neutralize `<parse>><cap>` -> `!1` + padding (always false), so the
-            # clamp branch never runs and `return <parse>` passes the raw value.
-            search = clamp_expr
-            replace = b"!1" + b" " * (len(search) - 2)
-            _n = stats["applied"]
-            data = apply_byte_patch(
-                data,
-                f"Disable retry cap clamp so CLAUDE_CODE_MAX_RETRIES=9999 works ({clamp_expr.decode()})",
-                search,
-                replace,
-                stats,
-                hint_offset=retry_cap_warn_offset,
-                max_dist=500,
-            )
-            ok["max_retries"] = stats["applied"] > _n
-        elif retry_cap_already_disabled(data, retry_cap_warn_offset):
-            print("  OK Disable retry cap clamp (already patched)")
-            stats["applied"] += 1
-            ok["max_retries"] = True
-        else:
-            print("  SKIP: Could not locate retry cap clamp expression", file=sys.stderr)
-            stats["failed"] += 1
-    else:
-        print("  SKIP: Retry cap variable not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    # -- Patch 2: Replace exponential backoff with fixed 1s interval -----------
-    print()
-    print("=== Patch 2: Replace exponential backoff with fixed 1s interval ===")
-    if backoff_literal:
-        # Newer builds inline the 500ms base. One same-length swap does base+pow.
-        # `500*` makes the search unique, so no hint offset is needed here (the
-        # bare Math.pow(2,e-1) below is the ambiguous one).
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            "Change 500*pow(2,e-1) to 1e3*pow(1,e-1) (fixed 1s)",
-            b"500*Math.pow(2,e-1)",
-            b"1e3*Math.pow(1,e-1)",
-            stats,
-        )
-        ok["backoff_base"] = ok["backoff_pow"] = stats["applied"] > _n
-    elif backoff_base_var:
-        search = backoff_base_var + b"=500"
-        replace = backoff_base_var + b"=1e3"
-        _n = stats["applied"]
-        data = apply_byte_patch(data, f"Change backoff base from 500ms to 1000ms ({backoff_base_var.decode()})", search, replace, stats)
-        ok["backoff_base"] = stats["applied"] > _n
-        # Math.pow(2,e-1) -> Math.pow(1,e-1)  (pow(1,n) always = 1)
-        # REQUIRES the hint offset from the backoff base variable: there are several
-        # Math.pow(2,e-1) in the binary (one is an unrelated calculateDelay backoff).
-        if backoff_base_hint_offset is not None:
-            _n = stats["applied"]
-            data = apply_byte_patch(
-                data,
-                "Change pow base 2->1 (disables exponential growth)",
-                b"Math.pow(2,e-1)",
-                b"Math.pow(1,e-1)",
-                stats,
-                hint_offset=backoff_base_hint_offset,
-                max_dist=100000,
-            )
-            ok["backoff_pow"] = stats["applied"] > _n
-        else:
-            print("  SKIP: no backoff-base hint; skipping pow(2->1) to avoid mis-patching an unrelated site", file=sys.stderr)
-            stats["failed"] += 1
-    elif backoff_done:
-        print("  OK Replace exponential backoff with fixed 1s (already patched)")
-        stats["applied"] += 1
-        ok["backoff_base"] = ok["backoff_pow"] = True
-    else:
-        print("  SKIP: Backoff pattern not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    # -- Patch 3: Patch Anthropic SDK built-in retry backoff -------------------
-    print()
-    print("=== Patch 3: Patch Anthropic SDK built-in retry backoff ===")
-    if sdk_pair:
-        search, replace = sdk_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            f"Change SDK backoff {search.decode()} -> {replace.decode()} (fixed ~1s delay)",
-            search,
-            replace,
-            stats,
-        )
-        ok["sdk"] = stats["applied"] > _n
-    elif sdk_done:
-        print("  OK Patch SDK backoff (already patched)")
-        stats["applied"] += 1
-        ok["sdk"] = True
-    else:
-        print("  SKIP: SDK backoff pattern not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    # -- Patch 4: Lower rate-limit fallback delays -----------------------------
-    print()
-    print("=== Patch 4: Lower rate-limit fallback delays ===")
-    if rl_fallback_var:
-        # Fallback: 1800000ms (30min) -> 1000ms (1s), space-padded to equal length.
-        # Do NOT pad with leading zeros: `0010000` is a legacy octal literal in
-        # sloppy-mode JS (= 4096, not 10000) and a SyntaxError under strict/ESM.
-        legacy_search = rl_fallback_var + b"=10000  "
-        search = legacy_search if legacy_search in data else rl_fallback_var + b"=1800000"
-        replace = rl_fallback_var + b"=1000   "
-        if rl_fallback_var + b"=0010000" in data:
-            print(f"  SKIP: {rl_fallback_var.decode()} holds =0010000, written by an older "
-                  f"version of this script; that is octal 4096ms, not 1000ms. "
-                  f"--restore and re-run to correct it.", file=sys.stderr)
-            stats["failed"] += 1
-        else:
-            _n = stats["applied"]
-            desc = (f"Update rate-limit fallback from 10s to 1s ({rl_fallback_var.decode()})"
-                    if search == legacy_search else
-                    f"Lower rate-limit fallback from 30min to 1s ({rl_fallback_var.decode()})")
-            data = apply_byte_patch(data, desc, search, replace, stats)
-            ok["rl_fallback"] = stats["applied"] > _n
-    else:
-        print("  SKIP: Rate-limit fallback variable not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    if rl_min_var:
-        # Minimum: 600000ms (10min) -> 1000ms (1s), space-padded (see above:
-        # `001000` would be octal 512, not 1000).
-        search = rl_min_var + b"=600000"
-        replace = rl_min_var + b"=1000  "
-        if rl_min_var + b"=001000" in data:
-            print(f"  SKIP: {rl_min_var.decode()} holds =001000, written by an older "
-                  f"version of this script; that is octal 512ms, not 1000ms. "
-                  f"--restore and re-run to correct it.", file=sys.stderr)
-            stats["failed"] += 1
-        else:
-            _n = stats["applied"]
-            data = apply_byte_patch(data, f"Lower rate-limit minimum from 10min to 1s ({rl_min_var.decode()})", search, replace, stats)
-            ok["rl_min"] = stats["applied"] > _n
-    else:
-        print("  SKIP: Rate-limit minimum variable not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    if rl_threshold_var:
-        # Threshold: 20000ms (20s) -> 99999ms (100s)
-        search = rl_threshold_var + b"=20000"
-        replace = rl_threshold_var + b"=99999"
-        _n = stats["applied"]
-        data = apply_byte_patch(data, f"Raise rate-limit env-var threshold from 20s to 100s ({rl_threshold_var.decode()})", search, replace, stats)
-        ok["rl_threshold"] = stats["applied"] > _n
-    else:
-        print("  SKIP: Rate-limit threshold variable not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    # -- Patch 5: Ignore Retry-After / ratelimit-reset (force ~1s) -------------
-    # Patch 2 only rewrites the exponential formula. 429s still wait on:
-    #   WB:  Math.max(Retry-After-seconds * 1000, jitter)  -- header wins
-    #   Hko: anthropic-ratelimit-unified-reset timestamp   -- watchdog 429 prefers this
-    #   Uko: Retry-After consumed as a direct sleep        -- non-watchdog 429 path
-    print()
-    print("=== Patch 5: Ignore Retry-After / ratelimit-reset ===")
-    if wb_retry_after_pair:
-        search, replace = wb_retry_after_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            "Ignore Retry-After in WB (use 1s jitter, not header seconds)",
-            search,
-            replace,
-            stats,
-        )
-        ok["retry_after_wb"] = stats["applied"] > _n
-    elif wb_retry_after_already_ignored(data):
-        print("  OK Ignore Retry-After in WB (already patched)")
-        stats["applied"] += 1
-        ok["retry_after_wb"] = True
-    else:
-        print("  SKIP: WB Retry-After honor not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    if uko_retry_after_pair:
-        search, replace = uko_retry_after_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            "Ignore Retry-After in Uko (do not sleep header seconds)",
-            search,
-            replace,
-            stats,
-        )
-        ok["retry_after_uko"] = stats["applied"] > _n
-    elif uko_retry_after_already_ignored(data):
-        print("  OK Ignore Retry-After in Uko (already patched)")
-        stats["applied"] += 1
-        ok["retry_after_uko"] = True
-    else:
-        print("  SKIP: Uko Retry-After parser not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    if hko_reset_pair:
-        search, replace = hko_reset_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            "Ignore anthropic-ratelimit-unified-reset in Hko (watchdog 429)",
-            search,
-            replace,
-            stats,
-        )
-        ok["retry_after_hko"] = stats["applied"] > _n
-    elif hko_reset_already_ignored(data):
-        print("  OK Ignore unified-reset in Hko (already patched)")
-        stats["applied"] += 1
-        ok["retry_after_hko"] = True
-    else:
-        print("  SKIP: Hko unified-reset guard not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    # -- Patch 6: Hardcode QPe/SDK delay to 1s (Hko?? short-circuits WB) ------
-    # Watchdog 429 does `xt = Hko(reset) ?? WB(...)`. Hko returns ms until
-    # anthropic-ratelimit-unified-reset (often minutes). Non-null Hko wins,
-    # so Patch 5 never runs. Write `xt=1000` at the assignment.
-    print()
-    print("=== Patch 6: Hardcode API retry delay to 1s ===")
-    if qpe_wd_pair:
-        search, replace = qpe_wd_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            "Hardcode watchdog 429 delay to 1000ms (bypass Hko/WB)",
-            search,
-            replace,
-            stats,
-        )
-        ok["qpe_wd"] = stats["applied"] > _n
-    elif qpe_watchdog_delay_already_hardcoded(data):
-        print("  OK Hardcode watchdog 429 delay (already patched)")
-        stats["applied"] += 1
-        ok["qpe_wd"] = True
-    else:
-        print("  SKIP: QPe watchdog 429 delay assignment not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    if qpe_plain_pair:
-        search, replace = qpe_plain_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data,
-            "Hardcode non-watchdog delay to 1000ms (bypass WB)",
-            search,
-            replace,
-            stats,
-        )
-        ok["qpe_plain"] = stats["applied"] > _n
-    elif qpe_plain_delay_already_hardcoded(data):
-        print("  OK Hardcode non-watchdog delay (already patched)")
-        stats["applied"] += 1
-        ok["qpe_plain"] = True
-    else:
-        print("  SKIP: QPe plain delay assignment not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    sdk_hits = 0
-    if sdk_ms_pair:
-        search, replace = sdk_ms_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data, "Ignore SDK retry-after-ms header", search, replace, stats
-        )
-        if stats["applied"] > _n:
-            sdk_hits += 1
-    elif sdk_retry_after_already_ignored(data):
-        print("  OK Ignore SDK retry-after-ms (already patched)")
-        stats["applied"] += 1
-        sdk_hits += 1
-    else:
-        print("  SKIP: SDK retry-after-ms guard not discovered", file=sys.stderr)
-        stats["failed"] += 1
-
-    if sdk_ra_pair:
-        search, replace = sdk_ra_pair
-        _n = stats["applied"]
-        data = apply_byte_patch(
-            data, "Ignore SDK retry-after / HTTP-date header", search, replace, stats
-        )
-        if stats["applied"] > _n:
-            sdk_hits += 1
-    elif sdk_retry_after_already_ignored(data):
-        print("  OK Ignore SDK retry-after (already patched)")
-        stats["applied"] += 1
-        sdk_hits += 1
-    else:
-        print("  SKIP: SDK retry-after guard not discovered", file=sys.stderr)
-        stats["failed"] += 1
-    ok["sdk_ra"] = sdk_hits == 2
-
-    # -- Summary ---------------------------------------------------------------
     print()
     print("===========================================================")
     print(f"  Patches {'in place' if already_patched else 'applied'}: {stats['applied']}")
@@ -1103,6 +998,8 @@ def main():
     print("===========================================================")
 
     if args.dry_run:
+        print()
+        print_summary(sites)
         print()
         if already_patched:
             print("DRY RUN - binary is already patched; nothing to do.")
@@ -1116,7 +1013,7 @@ def main():
     if stats["applied"] == 0:
         print()
         print("ERROR: No patches were applied; the binary is unchanged.", file=sys.stderr)
-        print("Claude Code was likely updated and the byte patterns no longer match.", file=sys.stderr)
+        print("Claude Code was likely updated and the code shapes no longer match.", file=sys.stderr)
         sys.exit(1)
 
     # -- Write patched binary --------------------------------------------------
@@ -1141,35 +1038,7 @@ def main():
     print("  export BUN_JSC_forceDebuggerBytecodeGeneration=1  # Recompile patched source in Bun")
     print()
     print("Retry behavior after patching:")
-    sep = "  +-------------------------+----------------------------------+"
-
-    def _row(setting, behavior):
-        return f"  | {setting:<24}| {behavior:<33}|"
-
-    def _behavior(flags, patched_text):
-        done = sum(1 for f in flags if f)
-        if done == len(flags):
-            return patched_text
-        if done == 0:
-            return "unchanged (patch skipped)"
-        return f"partially patched ({done}/{len(flags)})"
-
-    print(sep)
-    print(_row("Setting", "Behavior"))
-    print(sep)
-    print(_row("Max retries",
-               _behavior([ok["max_retries"]], "CLAUDE_CODE_MAX_RETRIES (=9999)")))
-    print(_row("General retry delay",
-               _behavior([ok["backoff_base"], ok["backoff_pow"]], "Fixed ~1 second")))
-    print(_row("Rate-limit retry delay",
-               _behavior([ok["rl_fallback"], ok["rl_min"], ok["rl_threshold"]], "Fixed ~1 second")))
-    print(_row("SDK-level retry delay",
-               _behavior([ok["sdk"]], "Fixed ~0.75-1 second")))
-    print(_row("Retry-After / reset",
-               _behavior([ok["retry_after_wb"], ok["retry_after_uko"], ok["retry_after_hko"],
-                          ok["qpe_wd"], ok["qpe_plain"], ok["sdk_ra"]],
-                         "ignored (always ~1s)")))
-    print(sep)
+    print_summary(sites)
     print()
     print("NOTE: After updating Claude Code (npm update), re-run this script.")
 

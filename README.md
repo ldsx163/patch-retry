@@ -11,6 +11,7 @@
 
 - codex 两版处理**真实机器码差异**：Linux 走 ELF/Mach-O 文件偏移空间；Windows 走 PE 的 VA 换算（`build_pe_off2va` / `build_pe_maps`）。两版都支持 `addsd` / `movsd [0.9]` 双锚点。
 - claude 两版补丁本体（内嵌 JS 文本）**逐字节相同**，差异仅在二进制发现、写文件、命令提示。
+- 两边都遵循同一条定位原则：**能用语义就不用字节串**，判据必须多条件同时成立，且可以在 `--dry-run` 里打印出来供人核对。
 
 ---
 
@@ -154,6 +155,23 @@ stream_idle_timeout_ms = 15000
 
 ## claude
 
+claude 有 **6 类**会决定重试等待，脚本全部压成固定 1 秒：
+
+| # | 位置（当前构建的压缩名，仅供对照） | 原行为 | 补丁 |
+|---|---|---|---|
+| 1 | `CLAUDE_CODE_MAX_RETRIES` 读取函数（`vEf`） | 早期版本会把环境变量夹到内部上限 | 夹取存在就改成恒假；不存在则**验证**确实不夹后放行 |
+| 2 | API 退避函数（`rle`） | `base × 2^(n-1) × jitter` | base→1000ms、指数底 2→1 |
+| 3 | SDK `calculateDefaultRetryTimeoutMillis` | `min(0.5×2^n, 8)` 秒 | 系数→1、指数底→1，约 0.75–1s |
+| 4 | 4 处 `Retry-After` / `ratelimit-reset` 读取 | 服务端要求的等待优先于退避 | 全部忽略，回落到 1s |
+| 5 | 限流长等待常量（`wEf`/`IEf`/`CEf`） | 30 分钟 / 10 分钟兜底 | 都改成 1s；内联睡眠阈值抬到 99999ms |
+| 6 | 重试循环里的 3 处延迟赋值 | `reset头 ?? min(退避, 6h)` 等 | 就地写死 `=1000` |
+
+> **站点 6 不是冗余**：watchdog 的 429 分支是 `x = resetHeader(err) ?? min(退避(...), 上限)`，`??` 会在 reset 头非空时**整条短路掉退避函数**——只打站点 2/4 的话这条路仍然等几分钟。必须改赋值本身。
+
+### 核心规则：只改「失败之后等多久」
+
+与 codex 部分同一条硬性约束：**只允许修改「已经判定失败之后，下一次尝试前等多久」，绝不修改「什么算失败」，也绝不修改「多久才判定为失败」。** 上面 6 类站点全部落在前者。
+
 ### Linux / macOS — `claude-linux.py`
 
 ```bash
@@ -183,15 +201,55 @@ $env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 ```
 
 > 说明：claude 的 npm 包入口文件名叫 `claude.exe`（`package.json` 的 `bin` 字段就是 `bin/claude.exe`），但在 Linux 上它其实是 ELF 二进制——`.exe` 只是官方全平台统一命名，不代表格式。
->
-> 指数退避改成约 1s 之后，429 仍会优先听从 `Retry-After` / `anthropic-ratelimit-unified-reset`（watchdog 路径里 reset 头会盖掉 1s 退避）。脚本会把这些头忽略，并把 API 重试等待写死为 1000ms。
+
+### 定位原则：只认代码形状，不认压缩名和魔数
+
+claude 的补丁本体是二进制里内嵌的压缩 JS 文本。**压缩器生成的标识符（`rle`、`xEf`、`wEf`…）每次发版都会变，写死它们等于给脚本设一个到期日。** 所以每处站点都靠**代码骨架**定位，名字和数值从匹配结果里读出来，而不是拿去搜索：
+
+| 站点 | 判据（结构，全部满足才改） | 不再依赖 |
+|---|---|---|
+| 2 | 一个 `Math.min(BASE*Math.pow(2,X-1), CAP)`，其中 ①`X` 是所在 `function` 的**第一个形参** ②紧随其后有 `Math.random()` 抖动项。二进制里另有 9 处 `Math.pow(2,n-1)` 退避（MCP 重连、OAuth 刷新、会话持久化…），全部被排除 | 函数名 `rle`、base 值 500 |
+| 3 | `calculateDefaultRetryTimeoutMillis` — SDK 由 TS 源码打包，类方法名是**真实 API 名**不被压缩，是稳定锚点 | 字面量 `0.5*Math.pow(2,` |
+| 4 | 头名 `retry-after` / `retry-after-ms` / `anthropic-ratelimit-unified-reset` 是**协议字符串**，不是压缩名；解析器骨架用回溯引用绑定同一个变量 | `xt` / `$t` / `rR` / `!s` 等压缩标识符 |
+| 5 | 阈值守卫与兜底 `Math.max` **必须引用同一个变量**，且读取函数必须是站点 4 认出的那个解析器 | `=1800000` / `=600000` / `=20000` |
+| 6 | 锚在遥测事件 `G("tengu_api_retry",{attempt:…,delayMs:X,…})` 上——它在自己的载荷里**报出了延迟变量名**，所以改名也跟得住 | 写死 `xt=` |
+| 1 | 无夹取时不是「假设没有」：完整匹配环境变量读取函数体，确认其中没有 `Math.min`/`Math.max` 才放行 | — |
+
+三道兜底：
+
+1. **每个判据都要求全局唯一**。形状匹配到 0 处或 2 处以上一律跳过并打印诊断，绝不取第一个。这条不是洁癖——旧版脚本正是因为拿第一个匹配，把补丁打到了一个**毫无关系的 OAuth 刷新函数**（`bxt=kRr(e,t,n)`）上。
+2. **所有改写等长**，数值放不下就用指数写法（`500`→`1e3`），再不行右侧补空格。**绝不用前导零补位**：`0010000` 在宽松模式 JS 里是八进制 4096，在严格/ESM 下直接语法错误。
+3. **幂等**：所有「已打过」判定同样是结构判定（读出当前数值再比对），不依赖上一版脚本写了什么，所以可以对半打过的二进制增量补齐。
+
+### 验证方式
+
+不依赖「跑起来看看」，而是三步可复现的离线校验：
+
+```bash
+cp <binary>.orig /tmp/claude.test
+python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 1. 每处判据是否命中
+python3 claude-linux.py           --binary /tmp/claude.test   # 2. 打一遍
+python3 claude-linux.py --dry-run --binary /tmp/claude.test   # 3. 应全部报 already patched
+```
+
+在 **claude-code 2.x（233584424 字节的 linux-x64 ELF）** 上的实测结果：
+
+- 15 处站点全部命中，0 跳过；文件大小逐字节不变，diff 只落在 12 段里。
+- 每段改写连同上下文用 `node --check` 校验过语法：取一个在**原始**二进制上也能解析的窗口，同一窗口在补丁后仍解析通过。
+- 补丁后的退避函数单独取出来跑，`attempt` 从 1 到 30、`Retry-After` 从 1s 到 3600s，返回值恒为 1050–1250ms；SDK 退避恒为约 840–880ms。
+- `claude-linux.py` 与 `claude-windows.py` 的探测/汇总代码逐字符相同（29151 字符），对同一输入产出**逐字节相同**的二进制；差异仅在二进制发现、写文件、命令提示。
 
 ### 参数（两版通用）
 
 | 参数 | 说明 |
 |---|---|
-| `--dry-run` | 显示将要改动的内容，不修改二进制 |
+| `--dry-run` | 显示将要改动的内容（含每处的改写前后），不修改二进制 |
 | `--restore` | 从 `.orig` 备份还原 |
+| `--binary <路径>` | 手动指定 `claude` / `claude.exe` 二进制 |
+
+### 版本适配说明
+
+结构判据比字节串耐用，但不是永久有效：上游若重写重试循环本身（而不只是改名或调参），形状就变了。升级 claude 后先跑 `--dry-run`，看 `Patches skipped` 是否为 0；某处跳过时会打印它期望的形状匹配了几处，据此定位。
 
 ---
 
