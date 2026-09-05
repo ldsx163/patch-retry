@@ -114,12 +114,28 @@ PLATFORM_TARGETS = {
     ("Darwin", "arm64"): ("@openai/codex-darwin-arm64", "aarch64-apple-darwin", "codex"),
 }
 
-# Site 3 signature (identical across System V and MSVC builds):
-#   mov edx,<cap> ; cmovb rdx,rcx ; cmp byte[rax+0x10],0 ; mov eax,5 ; cmovne rax,rdx
-STREAM_CAP_TAIL = bytes.fromhex("480f42d180781000b805000000480f45c2")
+# Site 3 (identical across System V and MSVC builds). Only the fixed middle is
+# matched; the cap and the unwrap_or default are read as immediates, so retuning
+# either upstream value does not break detection:
+#   mov edx,<cap> | cmovb rdx,rcx ; cmp byte[rax+0x10],0 | mov eax,<default> |
+#   cmovne rax,rdx
+STREAM_CAP_MID = bytes.fromhex("480f42d180781000")     # cmovb + Option check
+STREAM_CAP_CMOVNE = bytes.fromhex("480f45c2")          # cmovne rax,rdx
 
 # core::time::Duration::from_millis divide-by-1000 reciprocal (u64 magic).
+# Semantic, not incidental: the value is forced by `millis / 1000` on u64, so it
+# survives any codex change short of std switching division strategy.
 FROM_MILLIS_MAGIC = bytes.fromhex("cff753e3a59bc420")  # 0x20c49ba5e353f7cf, LE
+FROM_MILLIS_TAIL_SHR = bytes.fromhex("48c1e803")       # shr rax,3 (the /8 of /1000)
+
+# Sites 1-2: bounds of `random_range(a..b)` are jitter *multipliers*, so they sit
+# near 1.0. Matching the range rather than the literal 0.9 means a retuned jitter
+# window still resolves. Exactly 1.0 is excluded (that is no jitter at all).
+JITTER_BOUND_MIN, JITTER_BOUND_MAX = 0.5, 2.0
+
+# How far back from a from_millis tail the jitter multiply and its range bound
+# may sit (the inlined base/jitter arithmetic on this build spans ~70 bytes).
+JITTER_SCAN_BACK = 320
 
 # `mov <reg32>, imm32` opcode base; the low 3 bits select the register.
 MOV_R32_IMM = 0xB8
@@ -144,6 +160,15 @@ SITE4_JOIN_WINDOW = 32
 # and remote-compaction). A much larger count means the signature went loose, and
 # site 5 rewrites live instructions, so refuse rather than guess.
 MAX_CONN_SITES = 4
+
+# Site 5: the delay is confirmed by the `.min(MAX_CONNECTION_RETRY_DELAY)` clamp
+# in the same function -- a `cmp r64, imm8` against a whole-second cap. Bounded
+# by imm8 encoding; the range covers any plausible retry ceiling (currently 60s).
+LADDER_CAP_MIN, LADDER_CAP_MAX = 2, 127
+LADDER_WINDOW = 0x1000
+# Bytes between the `cmp r64,cap+1` and `cmp r64,cap` halves of the saturating
+# min() (on this build a single `setae` sits between them).
+LADDER_PAIR_GAP = 12
 
 # 32-bit GP register names by 4-bit register number (for readable logs).
 REG_NAMES = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
@@ -255,50 +280,41 @@ def segment_maps(segs: list[tuple[int, int, int]]):
 
 
 # ── Sites 1 & 2: in-place jitter -> fixed interval ────────────────────────────
-def _find_09_constant(data: bytes) -> int:
-    """File offset of the single 0.9 f64 constant (from `0.9..1.1`); die if the
-    count isn't exactly one (a signature the build no longer matches)."""
-    needle = struct.pack("<d", 0.9)
-    offs, i = [], data.find(needle)
-    while i != -1:
-        offs.append(i)
-        i = data.find(needle, i + 1)
-    if len(offs) != 1:
-        die(f"expected exactly one 0.9 jitter constant, found {len(offs)}")
-    return offs[0]
+def _f64_at(data: bytes, off: int):
+    """The f64 stored at `off`, or None if `off` is not a full 8 bytes inside the
+    image or the value is not finite."""
+    if off < 0 or off + 8 > len(data):
+        return None
+    value = struct.unpack_from("<d", data, off)[0]
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
 
 
-def _rip_f64_sites(data: bytes, c09: int, opcode: int) -> list[int]:
-    """Offsets of an SSE2 f64 instruction (opcode: 0x58 addsd / 0x10 movsd)
-    reading `[rip->0.9]`. ELF/Mach-O are single-mapping images, so `[rip+disp32]`
-    resolves in plain file-offset space (`next_instr_off + disp == c09`), unlike
-    PE which needs VA translation."""
-    sites = []
-    for pref in (b"\xf2\x0f" + bytes([opcode]),
-                 b"\xf2\x44\x0f" + bytes([opcode])):
-        plen, i = len(pref), data.find(pref)
-        while i != -1:
-            modrm = data[i + plen]
-            if (modrm & 0xC7) == 0x05:  # [rip+disp32]
-                disp = struct.unpack_from("<i", data, i + plen + 1)[0]
-                if (i + plen + 5) + disp == c09:
-                    sites.append(i)
-            i = data.find(pref, i + 1)
-    return sites
+def _jitter_bound_loads(data: bytes, lo: int, hi: int) -> list[tuple[int, int, float]]:
+    """(instr_off, const_off, value) for every reg-form SSE2 f64 `[rip+disp32]`
+    load in [lo,hi) whose constant is a plausible *jitter multiplier bound*.
 
-
-def _addsd_09_sites(data: bytes, c09: int) -> list[int]:
-    """Offsets of `addsd xmm,[rip->0.9]` -- the `random_range(0.9..1.1)`
-    fingerprint. Accepted unconditionally (a bare 0.9 addsd is jitter-specific)."""
-    return _rip_f64_sites(data, c09, 0x58)
-
-
-def _movsd_09_sites(data: bytes, c09: int) -> list[int]:
-    """Offsets of `movsd xmm,[rip->0.9]`. Newer codex builds (>=0.144.x) load the
-    0.9 lower bound with movsd for one backoff path. movsd also occurs in
-    unrelated math, so callers accept it only when the full from_millis chain
-    downstream also matches."""
-    return _rip_f64_sites(data, c09, 0x10)
+    This is what replaces hunting for the literal 0.9: `random_range(a..b)`
+    multiplies a delay by a factor near 1.0, so any bound must sit in
+    JITTER_BOUND_RANGE and cannot be exactly 1.0 (that would be no jitter). The
+    specific numbers 0.9/1.1 are codex's current choice, not a requirement --
+    if upstream retunes the range this keeps matching."""
+    out = []
+    for opcode in (0x10, 0x58, 0x5C):  # movsd / addsd / subsd
+        for pref in (b"\xf2\x0f" + bytes([opcode]),
+                     b"\xf2\x44\x0f" + bytes([opcode])):
+            plen, i = len(pref), data.find(pref, lo, hi)
+            while i != -1:
+                if (data[i + plen] & 0xC7) == 0x05:  # [rip+disp32]
+                    disp = struct.unpack_from("<i", data, i + plen + 1)[0]
+                    const = (i + plen + 5) + disp
+                    value = _f64_at(data, const)
+                    if (value is not None and value != 1.0
+                            and JITTER_BOUND_MIN < value < JITTER_BOUND_MAX):
+                        out.append((i, const, value))
+                i = data.find(pref, i + 1, hi)
+    return sorted(out)
 
 
 def _mulsd_len(data: bytes, off: int):
@@ -330,41 +346,55 @@ def _find_from_millis_tail(data: bytes, start: int, window: int = 384):
     return None
 
 
+def _all_from_millis_tails(data: bytes) -> list[tuple[int, int]]:
+    """(mov_off, millis_reg) for every inlined Duration::from_millis tail."""
+    out, i = [], data.find(FROM_MILLIS_TAIL_SHR)
+    while i != -1:
+        mv = i - 3
+        if mv >= 0 and (data[mv] in (0x48, 0x4C) and data[mv + 1] == 0x89
+                        and (data[mv + 2] & 0xC7) == 0xC0
+                        and FROM_MILLIS_MAGIC in data[i + 4 : i + 20]):
+            reg = ((data[mv + 2] >> 3) & 7) | (0x8 if data[mv] == 0x4C else 0)
+            out.append((mv, reg))
+        i = data.find(FROM_MILLIS_TAIL_SHR, i + 1)
+    return out
+
+
 def find_jitter_sites(data: bytes) -> list[dict]:
-    """Locate every `Duration::from_millis(delay*jitter)` site keyed on 0.9..1.1.
+    """Locate every `Duration::from_millis((delay * jitter) as u64)` site.
+
+    Driven by *structure*, not by a known constant. For each inlined from_millis
+    tail in the image, require all of:
+
+      * a reg-form `mulsd` before it (the `delay_ms * jitter` product) --
+        `from_millis` of a plain computed value has no such multiply;
+      * a jitter-range f64 bound loaded upstream of that multiply (any constant
+        near 1.0; see _jitter_bound_loads) -- this is the `random_range(a..b)`
+        fingerprint without hardcoding 0.9;
+      * a span between the two that is plausibly the jitter/base arithmetic.
+
+    On the 0.153.4 image 110 tails exist and exactly 2 satisfy all three, so the
+    conjunction -- not any single byte pattern -- is what identifies the sites.
     Each dict: {anchor, region_start, region_end, reg, current}."""
-    c09 = _find_09_constant(data)
     out = []
-    # Newer codex builds (>=0.144.x) use `movsd [0.9]` for one backoff path.
-    # Unlike `addsd`, movsd also occurs in unrelated math, so only accept it with
-    # every later from_millis/mulsd/span check satisfied.
-    anchors = ([(i, True, "addsd") for i in _addsd_09_sites(data, c09)]
-               + [(i, False, "movsd") for i in _movsd_09_sites(data, c09)])
-    for anchor, strict, kind in sorted(anchors):
-        tail = _find_from_millis_tail(data, anchor)
-        if tail is None:
-            if strict:
-                die(f"jitter add at 0x{anchor:x} has no matching from_millis tail")
-            continue
-        mv, reg = tail
+    for mv, reg in _all_from_millis_tails(data):
         # Nearest reg-form mulsd before the tail: the `delay_ms = f64 * jitter` op.
         mul = None
-        for j in range(mv - 1, max(anchor, mv - 320) - 1, -1):
+        for j in range(mv - 1, max(0, mv - JITTER_SCAN_BACK) - 1, -1):
             n = _mulsd_len(data, j)
             if n is not None:
                 mul = (j, n)
                 break
         if mul is None:
-            if strict:
-                die(f"no final mulsd before from_millis tail at 0x{mv:x}")
             continue
-        region_start = mul[0] + mul[1]
-        region_end = mv
+        region_start, region_end = mul[0] + mul[1], mv
         if not (REGION_MIN <= region_end - region_start <= REGION_MAX):
-            if strict:
-                die(f"implausible patch span [0x{region_start:x},0x{region_end:x}) "
-                    f"len {region_end - region_start}; refusing to write")
             continue
+        bounds = _jitter_bound_loads(data, max(0, mv - JITTER_SCAN_BACK), mv)
+        if not bounds:
+            continue
+        anchor, _const, _value = bounds[0]
+        kind = ", ".join(f"{v:g}" for _, _, v in bounds)
         # Idempotency: an already-patched site holds `mov <reg>,imm32` at start
         # (with a REX.B prefix when reg is r8..r15).
         current = None
@@ -503,7 +533,8 @@ def _conn_tail_ok(data: bytes, off: int, secs_reg: int, nanos_reg: int) -> bool:
     The rip-relative `lea` is load-bearing: unrelated code also spills a
     {secs,nanos} pair into a state machine (a stray `mov eax,60 ; xor ecx,ecx`
     reads exactly like an already-patched site), and that code continues with
-    base-relative `lea`s instead."""
+    base-relative `lea`s instead. It is a necessary condition only -- what
+    actually confirms the site is _has_ladder_near(), below."""
     if data[off : off + 2] != b"\x48\x89":
         return False
     m1 = data[off + 2]
@@ -521,15 +552,53 @@ def _conn_tail_ok(data: bytes, off: int, secs_reg: int, nanos_reg: int) -> bool:
             and (data[lea + 2] & 0xC7) == 0x05)
 
 
+def _ladder_cap_near(data: bytes, off: int, window: int = LADDER_WINDOW):
+    """The `min(MAX_CONNECTION_RETRY_DELAY)` cap guarding this delay, or None.
+
+    What makes a load *the* connection-retry delay is not its byte encoding but
+    that the same function also clamps the doubled value:
+
+        cmp <r64>, <cap+1>   ; 48 83 /7 imm8, from `.min(Duration::from_secs(C))`
+        setae/cmovbe ...     ; on u64 seconds
+
+    A bare `cmp r64, imm8` is far too common to mean anything (a tracing-level
+    check 30 bytes away encodes as `cmp rax,3`), so the *pair* is required: the
+    saturating u64 `.min()` emits adjacent compares against `cap+1` and `cap`,
+    separated only by the setae/setb that captures the first result. Requiring
+    that shape is what upgrades site 5 from a byte-pattern guess to a semantic
+    match: on the 0.153.4 image both load copies have such a pair in range, and
+    the six look-alike `mov eax,60 ; xor ecx,ecx` decoys have none."""
+    lo, hi = max(0, off - window), min(len(data) - 4, off + window)
+    best = None
+    for i in range(lo, hi):
+        if data[i] != 0x48 or data[i + 1] != 0x83 or (data[i + 2] & 0xF8) != 0xF8:
+            continue
+        imm = data[i + 3]
+        if not (LADDER_CAP_MIN < imm <= LADDER_CAP_MAX):
+            continue
+        # The companion `cmp r64, imm-1` follows within a few bytes (the setCC
+        # that consumes the first compare sits between them).
+        cap = imm - 1
+        paired = any(data[j] == 0x48 and data[j + 1] == 0x83
+                     and (data[j + 2] & 0xF8) == 0xF8 and data[j + 3] == cap
+                     for j in range(i + 4, min(i + 4 + LADDER_PAIR_GAP, len(data) - 4)))
+        if paired and (best is None or abs(i - off) < abs(best[0] - off)):
+            best = (i, cap)
+    return best
+
+
 def find_conn_delay_sites(data: bytes) -> list[dict]:
-    """Offsets of `let retry_delay = retry_state.connection_retry_delay;`.
+    """Sites of `let retry_delay = retry_state.connection_retry_delay;`.
 
         mov <secs64>, [<base>+0x10]     (48 8b /r, mod=01, disp8=0x10)
         mov <nanos32>,[<base>+0x18]     (8b /r,    mod=01, disp8=0x18)
 
     The absent REX means both destination registers are already < 8, which is
-    what lets the 7-byte replacement fit exactly. Also recognizes the patched
-    form so --dry-run reports the current value instead of "not found"."""
+    what lets the 7-byte replacement fit exactly. A candidate is accepted only
+    when _conn_tail_ok() *and* _ladder_cap_near() agree -- the latter is the
+    semantic check (this delay is the one clamped by the doubling ladder), the
+    former only proves the shape. Also recognizes the patched form so --dry-run
+    reports the current value instead of "not found"."""
     out: list[dict] = []
     i = data.find(b"\x48\x8b")
     while i != -1:
@@ -540,8 +609,11 @@ def find_conn_delay_sites(data: bytes) -> list[dict]:
             if (data[i + 4] == 0x8B and (m2 >> 6) == 0b01 and (m2 & 7) == base
                     and data[i + 6] == 0x18 and base != secs
                     and _conn_tail_ok(data, i + 7, secs, (m2 >> 3) & 7)):
-                out.append({"off": i, "secs_reg": secs, "nanos_reg": (m2 >> 3) & 7,
-                            "base_reg": base, "current": None})
+                ladder = _ladder_cap_near(data, i)
+                if ladder is not None:
+                    out.append({"off": i, "secs_reg": secs,
+                                "nanos_reg": (m2 >> 3) & 7, "base_reg": base,
+                                "ladder": ladder, "current": None})
         i = data.find(b"\x48\x8b", i + 1)
     out.extend(_find_patched_conn_delay_sites(data))
     return sorted(out, key=lambda s: s["off"])
@@ -556,9 +628,10 @@ def _find_patched_conn_delay_sites(data: bytes) -> list[dict]:
         reg = (modrm >> 3) & 7
         if modrm == (0xC0 | (reg << 3) | reg) and 0xB8 <= data[i - 5] <= 0xBF:
             secs = data[i - 5] - MOV_R32_IMM
-            if _conn_tail_ok(data, i + 2, secs, reg):
+            ladder = _ladder_cap_near(data, i - 5)
+            if ladder is not None and _conn_tail_ok(data, i + 2, secs, reg):
                 out.append({"off": i - 5, "secs_reg": secs, "nanos_reg": reg,
-                            "base_reg": None,
+                            "base_reg": None, "ladder": ladder,
                             "current": struct.unpack_from("<I", data, i - 4)[0]})
         i = data.find(b"\x31", i + 1)
     return out
@@ -581,19 +654,37 @@ def conn_delay_secs(ms: int) -> int:
 
 
 # ── Site 3 (stream_max_retries cap) ───────────────────────────────────────────
-def find_stream_cap_sites(data: bytes) -> list[int]:
-    """Offsets of `mov edx,<cap>` for each inlined stream_max_retries().min(cap)."""
-    sites, i = [], data.find(STREAM_CAP_TAIL)
+def find_stream_cap_sites(data: bytes) -> list[dict]:
+    """Sites of the inlined `stream_max_retries.unwrap_or(D).min(CAP)`.
+
+        mov    edx, <CAP>        ; the .min() bound -- what we rewrite
+        cmovb  rdx, rcx          ; take the configured value when it is smaller
+        cmp    byte [rax+0x10],0 ; Option discriminant: is it Some?
+        mov    eax, <D>          ; unwrap_or default
+        cmovne rax, rdx          ; Some -> the clamped value
+
+    Both immediates are read out rather than baked into the pattern, so a
+    retuned default (currently 5) or cap (currently 100) still matches. Each
+    dict: {off, cap, default}."""
+    sites: list[dict] = []
+    i = data.find(STREAM_CAP_MID)
     while i != -1:
-        if i >= 5 and data[i - 5] == 0xBA:  # `mov edx, imm32` immediately before tail
-            sites.append(i - 5)
-        i = data.find(STREAM_CAP_TAIL, i + 1)
+        mov_cap = i - 5
+        after = i + len(STREAM_CAP_MID)
+        if (mov_cap >= 0 and data[mov_cap] == 0xBA          # mov edx, imm32
+                and data[after] == 0xB8                      # mov eax, imm32
+                and data[after + 5 : after + 9] == STREAM_CAP_CMOVNE):
+            sites.append({
+                "off": mov_cap,
+                "cap": struct.unpack_from("<I", data, mov_cap + 1)[0],
+                "default": struct.unpack_from("<I", data, after + 1)[0],
+            })
+        i = data.find(STREAM_CAP_MID, i + 1)
     return sites
 
 
 def current_stream_caps(data: bytes) -> list[int]:
-    return sorted({struct.unpack_from("<I", data, s + 1)[0]
-                   for s in find_stream_cap_sites(data)})
+    return sorted({s["cap"] for s in find_stream_cap_sites(data)})
 
 
 # ── Plan ──────────────────────────────────────────────────────────────────────
@@ -708,14 +799,16 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
 
     # -- Sites 1 & 2: jitter -> fixed interval --------------------------------
     print()
-    print("=== Jitter backoff sites (random_range 0.9..1.1) ===")
-    c09 = _find_09_constant(data)
-    print(f"  0.9 jitter constant @ 0x{c09:x} (single, shared by both backoffs)")
+    print("=== Jitter backoff sites (from_millis of a jittered product) ===")
+    tails = _all_from_millis_tails(bytes(data))
+    print(f"  {len(tails)} inlined Duration::from_millis tail(s) in the image; "
+          f"keeping those with a mulsd + jitter-range bound upstream")
     edits, report = plan(data, ms)
     for idx, (label, s) in enumerate(report, 1):
         span = s["region_end"] - s["region_start"]
         print(f"  [{idx}] {label}")
-        print(f"        anchor  : {s['kind']} xmm,[rip->0.9] @ 0x{s['anchor']:x}")
+        print(f"        anchor  : jitter bound(s) {s['kind']} loaded "
+              f"@ 0x{s['anchor']:x}")
         print(f"        mulsd   : final reg-form @ 0x{s['mulsd']:x}")
         print(f"        millis  : from_millis reads {reg_name(s['reg'])} "
               f"(mov tail @ 0x{s['tail']:x})")
@@ -729,9 +822,12 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
     cap_sites = find_stream_cap_sites(data)
     cap_now = current_stream_caps(data)
     if cap_sites:
-        locs = ", ".join(f"0x{s:x}" for s in cap_sites)
+        locs = ", ".join(f"0x{s['off']:x}" for s in cap_sites)
+        defaults = sorted({s["default"] for s in cap_sites})
         print(f"  {len(cap_sites)} inlined site(s): {locs}")
         print(f"  current cap: {cap_now} -> {max_retries}")
+        print(f"  unwrap_or default (untouched): {defaults} "
+              f"- set stream_max_retries in config.toml to exceed it")
     else:
         print("  NOT FOUND - skipping (cap stays 100)")
 
@@ -767,10 +863,12 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
               f"are plausible - REFUSING to patch site 5 (signature went loose)")
         conn_sites = []
     for idx, s in enumerate(conn_sites, 1):
-        cur = "unpatched (5s start, doubling to 60s)" if s["current"] is None \
-            else f"{s['current']}s fixed"
+        ladder_off, cap = s["ladder"]
+        cur = f"unpatched (doubling ladder, capped at {cap}s)" \
+            if s["current"] is None else f"{s['current']}s fixed"
         print(f"  [{idx}] delay load @ 0x{s['off']:x}  "
               f"secs={reg_name(s['secs_reg'])} nanos={reg_name(s['nanos_reg'])}")
+        print(f"        verified: min({cap}s) ladder clamp @ 0x{ladder_off:x}")
         print(f"        current : {cur} -> {secs}s")
         print(f"        rewrite : 7B -> mov {reg_name(s['secs_reg'])},{secs} ; "
               f"xor {reg_name(s['nanos_reg'])},{reg_name(s['nanos_reg'])}")
@@ -808,7 +906,7 @@ def patch_binary(binary: Path, ms: int, max_retries: int, dry_run: bool) -> None
         data[off : off + len(patch)] = patch
     cap_bytes = struct.pack("<I", max_retries)
     for s in cap_sites:
-        data[s + 1 : s + 5] = cap_bytes
+        data[s["off"] + 1 : s["off"] + 5] = cap_bytes
 
     mode = binary.stat().st_mode  # preserve permissions (esp. the exec bit)
     tmp = binary.with_name(binary.name + ".tmp")
@@ -858,8 +956,6 @@ def self_test() -> None:
     blob = bytearray(b"\x00" * 64 + code + b"\x00" * 64)
     struct.pack_into("<i", blob, a_off + 4, c09 - (a_off + 8))  # rip disp -> c09
     struct.pack_into("<d", blob, c09, 0.9)
-    # ensure exactly one 0.9 in the buffer
-    assert bytes(blob).count(struct.pack("<d", 0.9)) == 1
     sites = find_jitter_sites(bytes(blob))
     assert len(sites) == 1, sites
     s = sites[0]
@@ -873,16 +969,25 @@ def self_test() -> None:
     patched[s["region_start"]:s["region_end"]] = patch
     s2 = find_jitter_sites(bytes(patched))[0]
     assert s2["current"] == 2500, s2
-    # Newer codex layout loads the 0.9 lower bound with movsd before multiplying.
+    # Newer codex layout loads the bound with movsd before multiplying.
     movsd_blob = bytearray(blob)
     movsd_blob[a_off + 2] = 0x10  # f2 0f 58 (addsd) -> f2 0f 10 (movsd)
     movsd_sites = find_jitter_sites(bytes(movsd_blob))
     assert len(movsd_sites) == 1 and movsd_sites[0]["anchor"] == a_off
-    # A bare movsd of 0.9 is not enough: unrelated loads have no from_millis tail.
+    # A bare bound load is not enough: unrelated loads have no from_millis tail.
     unrelated = bytearray(movsd_blob)
     magic = unrelated.find(FROM_MILLIS_MAGIC)
     unrelated[magic:magic + len(FROM_MILLIS_MAGIC)] = b"\x00" * len(FROM_MILLIS_MAGIC)
     assert find_jitter_sites(bytes(unrelated)) == []
+    # Detection is on the jitter *range*, not the literal 0.9: a retuned window
+    # still resolves, while a constant that is not a jitter multiplier does not.
+    for bound, expected in ((0.75, 1), (1.25, 1), (0.9, 1),
+                            (1.0, 0),        # exactly 1.0 == no jitter
+                            (200.0, 0)):     # a delay, not a multiplier
+        probe = bytearray(blob)
+        struct.pack_into("<d", probe, c09, bound)
+        assert len(find_jitter_sites(bytes(probe))) == expected, bound
+    _self_test_site3()
     _self_test_site4()
     _self_test_site5()
     # format detection: ELF accepted, PE rejected via die()/SystemExit.
@@ -894,6 +999,30 @@ def self_test() -> None:
     else:
         raise AssertionError("PE should be rejected by the Linux build")
     print("self-test OK")
+
+
+def _self_test_site3() -> None:
+    """`unwrap_or(D).min(CAP)` with both immediates read out, not hardcoded."""
+    def build(cap: int, default: int) -> bytes:
+        return (bytes([0xBA]) + struct.pack("<I", cap)      # mov edx, cap
+                + STREAM_CAP_MID                            # cmovb + Option check
+                + bytes([0xB8]) + struct.pack("<I", default)  # mov eax, default
+                + STREAM_CAP_CMOVNE)                        # cmovne rax,rdx
+    at = 0x20
+    blob = b"\x00" * at + build(100, 5) + b"\x00" * 0x20
+    sites = find_stream_cap_sites(blob)
+    assert len(sites) == 1, sites
+    assert sites[0] == {"off": at, "cap": 100, "default": 5}, sites[0]
+    assert current_stream_caps(blob) == [100]
+    # a retuned default and cap must still be found (this is the point)
+    other = b"\x00" * at + build(250, 3) + b"\x00" * 0x20
+    assert find_stream_cap_sites(other)[0]["cap"] == 250
+    assert find_stream_cap_sites(other)[0]["default"] == 3
+    # already-patched cap reads back as-is
+    done = b"\x00" * at + build(9999, 5) + b"\x00" * 0x20
+    assert current_stream_caps(done) == [9999]
+    # the fixed middle alone, without the two movs around it, is not a site
+    assert find_stream_cap_sites(b"\x00" * at + STREAM_CAP_MID + b"\x00" * 0x20) == []
 
 
 def _self_test_site4() -> None:
@@ -941,18 +1070,32 @@ def _self_test_site4() -> None:
 
 
 def _self_test_site5() -> None:
-    """Synthetic connection-delay load plus the tail that identifies it."""
+    """Synthetic connection-delay load plus the tail and ladder that confirm it."""
     load = b"\x48\x8b\x48\x10" + b"\x8b\x40\x18"          # rcx <- secs, eax <- nanos
     tail = (b"\x48\x89\x8b" + struct.pack("<i", 0x1b8)     # mov [rbx+0x1b8],rcx
             + b"\x89\x83" + struct.pack("<i", 0x1c0)       # mov [rbx+0x1c0],eax
             + b"\x48\x8d\x05" + struct.pack("<i", 0x40))   # lea rax,[rip+0x40]
+    # the saturating min(60s): cmp rax,0x3d ; setae sil ; cmp rax,0x3c
+    ladder = (b"\x48\x83\xf8\x3d" + b"\x40\x0f\x93\xc6"
+              + b"\x48\x83\xf8\x3c")
     at = 0x40
-    blob = bytearray(b"\x00" * at + load + tail + b"\x00" * 0x40)
+    blob = bytearray(b"\x00" * at + load + tail + ladder + b"\x00" * 0x40)
+    # without the ladder clamp nearby the shape alone is rejected
+    assert find_conn_delay_sites(b"\x00" * at + load + tail + b"\x00" * 0x40) == []
     sites = find_conn_delay_sites(bytes(blob))
     assert len(sites) == 1, sites
     s = sites[0]
     assert (s["off"], s["secs_reg"], s["nanos_reg"], s["base_reg"]) == (at, 1, 0, 0), s
     assert s["current"] is None
+    assert s["ladder"][1] == 60, s["ladder"]  # cmp rax,0x3d -> a 60s ceiling
+    # a retuned ceiling is still recognized (the cap value is read, not assumed)
+    retuned = bytearray(b"\x00" * at + load + tail
+                        + b"\x48\x83\xf8\x1f" + b"\x40\x0f\x93\xc6"
+                        + b"\x48\x83\xf8\x1e" + b"\x00" * 0x40)
+    assert find_conn_delay_sites(bytes(retuned))[0]["ladder"][1] == 30
+    # a lone cmp (e.g. a tracing-level check) is not a ladder: the pair is required
+    lone_cmp = b"\x00" * at + load + tail + b"\x48\x83\xf8\x03" + b"\x00" * 0x40
+    assert find_conn_delay_sites(lone_cmp) == []
     patch = make_conn_delay_patch(s["secs_reg"], s["nanos_reg"], 1)
     assert patch == b"\xb9\x01\x00\x00\x00\x31\xc0", patch.hex(" ")
     assert len(patch) == len(load)
@@ -979,7 +1122,7 @@ def main() -> None:
         description="Patch Codex native binary retry backoff interval "
                     "(Linux/macOS ELF/Mach-O, x86-64)")
     parser.add_argument("--binary", help="path to native codex binary")
-    parser.add_argument("--dry-run", "--check", dest="dry_run", action="store_true",
+    parser.add_argument("--dry-run", action="store_true",
                         help="inspect only; do not write or back up")
     parser.add_argument("--restore", action="store_true", help="restore binary from .orig backup")
     parser.add_argument("--self-test", action="store_true", help="run small internal checks")
