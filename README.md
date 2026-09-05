@@ -1,6 +1,6 @@
 # Retry / Backoff 补丁脚本 — 使用说明
 
-> 操作前先**退出正在运行的 codex / claude**；两个二进制都装在用户 npm 目录（`~/.npm-global`），**无需 sudo**；所有脚本都支持预览（统一用 `--check`）和 `--restore` 还原，打补丁前自动备份为 `<binary>.orig`。
+> 操作前先**退出正在运行的 codex / claude**；两个二进制都装在用户 npm 目录（`~/.npm-global`），**无需 sudo**；所有脚本都支持预览（`--dry-run`）和 `--restore` 还原，打补丁前自动备份为 `<binary>.orig`。
 
 按平台拆成 4 个脚本；每个脚本启动时会**检测当前系统环境**（`os.name`），跑错平台会直接拒绝并提示改用对应脚本：
 
@@ -81,7 +81,7 @@ request_max_retries = 10
 ### Linux / macOS — `claude-linux.py`
 
 ```bash
-python3 claude-linux.py --check       # 预览
+python3 claude-linux.py --dry-run     # 预览
 python3 claude-linux.py               # 打补丁
 python3 claude-linux.py --restore     # 还原
 ```
@@ -90,7 +90,7 @@ python3 claude-linux.py --restore     # 还原
 
 ```powershell
 # 需先关闭正在运行的 claude.exe（Windows 会锁定运行中的可执行文件）
-py claude-windows.py --check
+py claude-windows.py --dry-run
 py claude-windows.py
 py claude-windows.py --restore
 ```
@@ -99,16 +99,22 @@ py claude-windows.py --restore
 
 ```bash
 export CLAUDE_CODE_MAX_RETRIES=9999            # Linux / macOS
+export CLAUDE_CODE_RETRY_WATCHDOG=1            # 429/过载持续重试，并解除 15 次上限
+export BUN_JSC_forceDebuggerBytecodeGeneration=1 # 让 standalone Bun 使用已修改的源码
 $env:CLAUDE_CODE_MAX_RETRIES="9999"            # Windows (PowerShell)
+$env:CLAUDE_CODE_RETRY_WATCHDOG="1"
+$env:BUN_JSC_forceDebuggerBytecodeGeneration="1"
 ```
 
 > 说明：claude 的 npm 包入口文件名叫 `claude.exe`（`package.json` 的 `bin` 字段就是 `bin/claude.exe`），但在 Linux 上它其实是 ELF 二进制——`.exe` 只是官方全平台统一命名，不代表格式。
+>
+> 指数退避改成约 1s 之后，429 仍会优先听从 `Retry-After` / `anthropic-ratelimit-unified-reset`（watchdog 路径里 reset 头会盖掉 1s 退避）。脚本会把这些头忽略，并把 API 重试等待写死为 1000ms。
 
 ### 参数（两版通用）
 
 | 参数 | 说明 |
 |---|---|
-| `--check` | 显示将要改动的内容，不修改二进制 |
+| `--dry-run` | 显示将要改动的内容，不修改二进制 |
 | `--restore` | 从 `.orig` 备份还原 |
 
 ---

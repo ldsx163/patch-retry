@@ -5,6 +5,7 @@ claude-linux.py - Patch Claude Code binary (Linux/macOS) to:
   2. Replace exponential backoff with fixed 1s interval
   3. Patch the Anthropic SDK's built-in retry backoff
   4. Lower rate-limit fallback delays
+  5. Ignore Retry-After / ratelimit-reset so 429s also wait ~1s
 
 Linux/macOS-only build of patch-retry-claude. The byte patches are the minified
 JS text embedded in the binary and are identical on every platform; only binary
@@ -22,6 +23,8 @@ Options:
 
 Environment variables (after patching):
   CLAUDE_CODE_MAX_RETRIES=9999      - Max retry attempts (internal cap disabled)
+  CLAUDE_CODE_RETRY_WATCHDOG=1      - Persistent 429/overloaded retry (lifts the 15 cap)
+  BUN_JSC_forceDebuggerBytecodeGeneration=1 - Recompile patched source in Bun
 
 Version-agnostic: This script dynamically discovers minified variable names
 by searching for code structure patterns (e.g. "clamped to ${VAR}" near
@@ -77,6 +80,26 @@ def require_unix_image(data: bytes, binary_path: str) -> None:
 
 def find_binary() -> str:
     """Find the Claude Code binary path (Linux/macOS)."""
+
+    def resolve_launcher(path: str) -> str:
+        """Follow a small shell launcher such as ~/.local/bin/claude."""
+        path = os.path.realpath(path)
+        try:
+            with open(path, "rb") as f:
+                head = f.read(4096)
+        except OSError:
+            return path
+        if not head.startswith(b"#!"):
+            return path
+        match = re.search(rb'exec\s+["\']([^"\']+)["\']', head)
+        if not match:
+            return path
+        target = os.path.expandvars(os.path.expanduser(match.group(1).decode("utf-8", "replace")))
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(path), target)
+        target = os.path.realpath(target)
+        return target if os.path.isfile(target) else path
+
     candidates = []
 
     # Try `which claude` first
@@ -85,7 +108,7 @@ def find_binary() -> str:
             ["which", "claude"], capture_output=True, text=True, timeout=5
         )
         if result.returncode == 0:
-            path = os.path.realpath(result.stdout.strip())
+            path = resolve_launcher(result.stdout.strip())
             if os.path.isfile(path):
                 return path
     except Exception:
@@ -339,6 +362,188 @@ def discover_rate_limit_vars(data: bytes) -> tuple[bytes | None, bytes | None, b
     return fallback_var, min_var, threshold_var
 
 
+def legacy_rate_limit_fallback_present(data: bytes) -> bool:
+    """Return True for the previous 10s fallback patch that needs migration."""
+    fallback_var, _, _ = discover_rate_limit_vars(data)
+    return bool(fallback_var and fallback_var + b"=10000  " in data)
+
+
+_IDENT = rb'[a-zA-Z_$][a-zA-Z0-9_$]*'
+
+
+def discover_wb_retry_after_honor(data: bytes) -> tuple[bytes, bytes] | None:
+    """WB: `return Math.max(parsed*1000, jitter)` -> `return jitter` (padded).
+
+    After Patch 2 the exponential formula is already ~1s, but a Retry-After
+    header still wins via Math.max. Drop the header so the 1s jitter is used.
+    Unique in current builds (one hit).
+    """
+    m = re.search(rb'return Math\.max\((' + _IDENT + rb')\*1000,(' + _IDENT + rb')\)', data)
+    if not m:
+        return None
+    search = m.group(0)
+    jitter = m.group(2)
+    replace = b"return " + jitter + b" " * (len(search) - len(b"return ") - len(jitter))
+    if len(search) != len(replace):
+        return None
+    return search, replace
+
+
+def wb_retry_after_already_ignored(data: bytes) -> bool:
+    """True if WB no longer does Math.max(Retry-After-ms, jitter)."""
+    if re.search(rb'return Math\.max\(' + _IDENT + rb'\*1000,' + _IDENT + rb'\)', data):
+        return False
+    # Patched form: `if(!isNaN(u))return o                 }return o`
+    return re.search(
+        rb'if\(!isNaN\(' + _IDENT + rb'\)\)return ' + _IDENT + rb' {2,}\}return ',
+        data,
+    ) is not None
+
+
+def discover_uko_retry_after_ms(data: bytes) -> tuple[bytes, bytes] | None:
+    """Uko: `return parsed*1000}return null` -> `return null  }return null`.
+
+    Non-watchdog 429 path sleeps this many ms directly. Force null so it
+    skips the header wait. Unique in current builds (one hit).
+    """
+    m = re.search(rb'return (' + _IDENT + rb')\*1000\}return null', data)
+    if not m:
+        return None
+    search = m.group(0)
+    parsed = m.group(1)
+    head = b"return " + parsed + b"*1000"
+    replace = b"return null" + b" " * (len(head) - len(b"return null")) + search[len(head):]
+    if len(search) != len(replace):
+        return None
+    return search, replace
+
+
+def uko_retry_after_already_ignored(data: bytes) -> bool:
+    """True if Uko no longer returns Retry-After as milliseconds."""
+    if re.search(rb'return ' + _IDENT + rb'\*1000\}return null', data):
+        return False
+    return re.search(
+        rb'if\(!isNaN\(' + _IDENT + rb'\)\)return null +\}return null',
+        data,
+    ) is not None
+
+
+def discover_hko_reset_null_guard(data: bytes) -> tuple[bytes, bytes] | None:
+    """Hko: `get?.("anthropic-ratelimit-unified-reset");if(!VAR)return null`.
+
+    Watchdog 429 prefers this reset-timestamp delay over WB. Force the null
+    branch (`if(!0)`) so it falls through to the 1s WB delay.
+    """
+    m = re.search(
+        rb'get\?\.\("anthropic-ratelimit-unified-reset"\);if\(!(' + _IDENT + rb')\)return null',
+        data,
+    )
+    if not m:
+        return None
+    search = m.group(0)
+    var = m.group(1)
+    old = b"if(!" + var + b")"
+    new = b"if(!0)" + b" " * (len(var) - 1)
+    replace = search.replace(old, new, 1)
+    if len(search) != len(replace):
+        return None
+    return search, replace
+
+
+def hko_reset_already_ignored(data: bytes) -> bool:
+    """True if Hko always takes the null branch after reading unified-reset."""
+    return b'get?.("anthropic-ratelimit-unified-reset");if(!0)' in data
+
+
+def discover_qpe_watchdog_delay(data: bytes) -> tuple[bytes, bytes] | None:
+    """QPe watchdog 429: `xt=(status===429?Hko(...):null)??Math.min(WB(...),cap)`.
+
+    Hko returns ms-until-unified-reset (minutes) and `??` keeps that value, so
+    Patch 5's WB/Hko edits never run. Hardcode `xt=1000` at the assignment.
+    """
+    m = re.search(
+        rb'xt=\(' + _IDENT + rb' instanceof \$t&&' + _IDENT
+        + rb'\.status===429\?' + _IDENT + rb'\(' + _IDENT
+        + rb'\):null\)\?\?Math\.min\(' + _IDENT + rb'\(' + _IDENT
+        + rb',' + _IDENT + rb',' + _IDENT + rb'\),' + _IDENT + rb'\)',
+        data,
+    )
+    if not m:
+        return None
+    search = m.group(0)
+    replace = b"xt=1000" + b" " * (len(search) - len(b"xt=1000"))
+    if len(search) != len(replace):
+        return None
+    return search, replace
+
+
+def qpe_watchdog_delay_already_hardcoded(data: bytes) -> bool:
+    """True if the watchdog 429 assignment is already `xt=1000` plus padding."""
+    return re.search(rb'xt=1000 {8,}', data) is not None
+
+
+def discover_qpe_plain_delay(data: bytes) -> tuple[bytes, bytes] | None:
+    """Non-watchdog QPe: `xt=WB(attempt, retryAfter)` -> `xt=1000`."""
+    m = re.search(rb'xt=(' + _IDENT + rb')\((' + _IDENT + rb'),(' + _IDENT + rb')\)', data)
+    if not m:
+        return None
+    search = m.group(0)
+    replace = b"xt=1000" + b" " * (len(search) - len(b"xt=1000"))
+    if len(search) != len(replace):
+        return None
+    return search, replace
+
+
+def qpe_plain_delay_already_hardcoded(data: bytes) -> bool:
+    return re.search(rb'xt=1000 {2,},!rR\(\)', data) is not None
+
+
+def discover_sdk_retry_after_ms_guard(data: bytes) -> tuple[bytes, bytes] | None:
+    """SDK retryRequest: skip `retry-after-ms` (`if(header)` -> `if(0)`)."""
+    m = re.search(
+        rb'get\("retry-after-ms"\);if\((' + _IDENT + rb')\)\{let '
+        + _IDENT + rb'=parseFloat\(\1\)',
+        data,
+    )
+    if not m:
+        return None
+    var = m.group(1)
+    search = b"if(" + var + b"){"
+    replace = b"if(0)" + b" " * (len(var) - 1) + b"{"
+    # Unique-ify with the get() prefix so we don't hit unrelated if(var){
+    full_search = b'get("retry-after-ms");' + search
+    full_replace = b'get("retry-after-ms");' + replace
+    if len(full_search) != len(full_replace):
+        return None
+    return full_search, full_replace
+
+
+def discover_sdk_retry_after_guard(data: bytes) -> tuple[bytes, bytes] | None:
+    """SDK retryRequest: skip `retry-after` / HTTP-date (`if(a&&!s)` -> `if(0&&!s)`)."""
+    m = re.search(
+        rb'get\("retry-after"\);if\((' + _IDENT + rb')&&!s\)\{let '
+        + _IDENT + rb'=parseFloat\(\1\)',
+        data,
+    )
+    if not m:
+        return None
+    var = m.group(1)
+    search = b"if(" + var + b"&&!s)"
+    replace = b"if(0" + b" " * (len(var) - 1) + b"&&!s)"
+    full_search = b'get("retry-after");' + search
+    full_replace = b'get("retry-after");' + replace
+    if len(full_search) != len(full_replace):
+        return None
+    return full_search, full_replace
+
+
+def sdk_retry_after_already_ignored(data: bytes) -> bool:
+    return (
+        b'get("retry-after-ms");if(0)' in data
+        and b'get("retry-after");if(0' in data
+    )
+
+
 def looks_already_patched(data: bytes) -> bool:
     """Return True if the binary already contains this script's own edits.
 
@@ -349,9 +554,24 @@ def looks_already_patched(data: bytes) -> bool:
     Patching again would be a no-op at best, so the write path refuses and asks
     for a --restore first. --dry-run is allowed through: it writes nothing, and
     reporting the current per-patch state is exactly what it's for.
+
+    An older run of this script (backoff patched, Retry-After still honored)
+    must NOT count as fully patched: Patch 5 still needs to be written.
     """
     sentinels = (b"1.0*Math.pow(1,", b"Math.pow(1,e-1)")
-    return any(s in data for s in sentinels)
+    if not any(s in data for s in sentinels):
+        return False
+    # Migrate the earlier version's 10s fallback instead of treating it as
+    # complete; the normal patch flow will replace it with the 1s value.
+    if legacy_rate_limit_fallback_present(data):
+        return False
+    return (
+        wb_retry_after_already_ignored(data)
+        and uko_retry_after_already_ignored(data)
+        and hko_reset_already_ignored(data)
+        and qpe_watchdog_delay_already_hardcoded(data)
+        and sdk_retry_after_already_ignored(data)
+    )
 
 
 def write_patched(binary_path: str, data: bytearray) -> None:
@@ -502,6 +722,51 @@ def main():
     if not rl_fallback_var or not rl_min_var or not rl_threshold_var:
         print("  WARN: Could not discover all rate-limit variables", file=sys.stderr)
 
+    wb_retry_after_pair = discover_wb_retry_after_honor(data)
+    uko_retry_after_pair = discover_uko_retry_after_ms(data)
+    hko_reset_pair = discover_hko_reset_null_guard(data)
+    if wb_retry_after_pair:
+        print("  Retry-After honor (WB): Math.max(header*1000, jitter)")
+    elif wb_retry_after_already_ignored(data):
+        print("  Retry-After honor (WB): already ignored")
+    else:
+        print("  WARN: Could not discover WB Retry-After honor", file=sys.stderr)
+    if uko_retry_after_pair:
+        print("  Retry-After ms (Uko): return parsed*1000")
+    elif uko_retry_after_already_ignored(data):
+        print("  Retry-After ms (Uko): already ignored")
+    else:
+        print("  WARN: Could not discover Uko Retry-After parser", file=sys.stderr)
+    if hko_reset_pair:
+        print("  ratelimit-reset (Hko): if(!var)return null")
+    elif hko_reset_already_ignored(data):
+        print("  ratelimit-reset (Hko): already ignored")
+    else:
+        print("  WARN: Could not discover Hko unified-reset guard", file=sys.stderr)
+
+    qpe_wd_pair = discover_qpe_watchdog_delay(data)
+    qpe_plain_pair = discover_qpe_plain_delay(data)
+    sdk_ms_pair = discover_sdk_retry_after_ms_guard(data)
+    sdk_ra_pair = discover_sdk_retry_after_guard(data)
+    if qpe_wd_pair:
+        print("  QPe watchdog 429 delay: Hko??WB(...)")
+    elif qpe_watchdog_delay_already_hardcoded(data):
+        print("  QPe watchdog 429 delay: already hardcoded 1000ms")
+    else:
+        print("  WARN: Could not discover QPe watchdog 429 delay assignment", file=sys.stderr)
+    if qpe_plain_pair:
+        print("  QPe plain delay: xt=WB(attempt, retryAfter)")
+    elif qpe_plain_delay_already_hardcoded(data):
+        print("  QPe plain delay: already hardcoded 1000ms")
+    else:
+        print("  WARN: Could not discover QPe plain delay assignment", file=sys.stderr)
+    if sdk_ms_pair and sdk_ra_pair:
+        print("  SDK retryRequest: honors retry-after / retry-after-ms")
+    elif sdk_retry_after_already_ignored(data):
+        print("  SDK retryRequest: already ignores Retry-After")
+    else:
+        print("  WARN: Could not discover SDK Retry-After guards", file=sys.stderr)
+
     # -- Save hint offset for Math.pow patch before backoff base is overwritten --
     backoff_base_hint_offset = None
     if backoff_base_var:
@@ -523,6 +788,12 @@ def main():
         "rl_fallback": False,   # Patch 4 (fallback)  -> Rate-limit retry delay row
         "rl_min": False,        # Patch 4 (minimum)   -> Rate-limit retry delay row
         "rl_threshold": False,  # Patch 4 (threshold) -> Rate-limit retry delay row
+        "retry_after_wb": False,   # Patch 5 (WB Math.max) -> Retry-After row
+        "retry_after_uko": False,  # Patch 5 (Uko ms)      -> Retry-After row
+        "retry_after_hko": False,  # Patch 5 (Hko reset)   -> Retry-After row
+        "qpe_wd": False,           # Patch 6 (hardcode xt) -> call-site 1s
+        "qpe_plain": False,
+        "sdk_ra": False,
     }
 
     # -- Patch 1: Remove retry cap --------------------------------------------
@@ -631,19 +902,23 @@ def main():
     print()
     print("=== Patch 4: Lower rate-limit fallback delays ===")
     if rl_fallback_var:
-        # Fallback: 1800000ms (30min) -> 10000ms (10s), space-padded to equal length.
+        # Fallback: 1800000ms (30min) -> 1000ms (1s), space-padded to equal length.
         # Do NOT pad with leading zeros: `0010000` is a legacy octal literal in
         # sloppy-mode JS (= 4096, not 10000) and a SyntaxError under strict/ESM.
-        search = rl_fallback_var + b"=1800000"
-        replace = rl_fallback_var + b"=10000  "
+        legacy_search = rl_fallback_var + b"=10000  "
+        search = legacy_search if legacy_search in data else rl_fallback_var + b"=1800000"
+        replace = rl_fallback_var + b"=1000   "
         if rl_fallback_var + b"=0010000" in data:
             print(f"  SKIP: {rl_fallback_var.decode()} holds =0010000, written by an older "
-                  f"version of this script; that is octal 4096ms, not 10000ms. "
+                  f"version of this script; that is octal 4096ms, not 1000ms. "
                   f"--restore and re-run to correct it.", file=sys.stderr)
             stats["failed"] += 1
         else:
             _n = stats["applied"]
-            data = apply_byte_patch(data, f"Lower rate-limit fallback from 30min to 10s ({rl_fallback_var.decode()})", search, replace, stats)
+            desc = (f"Update rate-limit fallback from 10s to 1s ({rl_fallback_var.decode()})"
+                    if search == legacy_search else
+                    f"Lower rate-limit fallback from 30min to 1s ({rl_fallback_var.decode()})")
+            data = apply_byte_patch(data, desc, search, replace, stats)
             ok["rl_fallback"] = stats["applied"] > _n
     else:
         print("  SKIP: Rate-limit fallback variable not discovered", file=sys.stderr)
@@ -677,6 +952,148 @@ def main():
     else:
         print("  SKIP: Rate-limit threshold variable not discovered", file=sys.stderr)
         stats["failed"] += 1
+
+    # -- Patch 5: Ignore Retry-After / ratelimit-reset (force ~1s) -------------
+    # Patch 2 only rewrites the exponential formula. 429s still wait on:
+    #   WB:  Math.max(Retry-After-seconds * 1000, jitter)  -- header wins
+    #   Hko: anthropic-ratelimit-unified-reset timestamp   -- watchdog 429 prefers this
+    #   Uko: Retry-After consumed as a direct sleep        -- non-watchdog 429 path
+    print()
+    print("=== Patch 5: Ignore Retry-After / ratelimit-reset ===")
+    if wb_retry_after_pair:
+        search, replace = wb_retry_after_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data,
+            "Ignore Retry-After in WB (use 1s jitter, not header seconds)",
+            search,
+            replace,
+            stats,
+        )
+        ok["retry_after_wb"] = stats["applied"] > _n
+    elif wb_retry_after_already_ignored(data):
+        print("  OK Ignore Retry-After in WB (already patched)")
+        stats["applied"] += 1
+        ok["retry_after_wb"] = True
+    else:
+        print("  SKIP: WB Retry-After honor not discovered", file=sys.stderr)
+        stats["failed"] += 1
+
+    if uko_retry_after_pair:
+        search, replace = uko_retry_after_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data,
+            "Ignore Retry-After in Uko (do not sleep header seconds)",
+            search,
+            replace,
+            stats,
+        )
+        ok["retry_after_uko"] = stats["applied"] > _n
+    elif uko_retry_after_already_ignored(data):
+        print("  OK Ignore Retry-After in Uko (already patched)")
+        stats["applied"] += 1
+        ok["retry_after_uko"] = True
+    else:
+        print("  SKIP: Uko Retry-After parser not discovered", file=sys.stderr)
+        stats["failed"] += 1
+
+    if hko_reset_pair:
+        search, replace = hko_reset_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data,
+            "Ignore anthropic-ratelimit-unified-reset in Hko (watchdog 429)",
+            search,
+            replace,
+            stats,
+        )
+        ok["retry_after_hko"] = stats["applied"] > _n
+    elif hko_reset_already_ignored(data):
+        print("  OK Ignore unified-reset in Hko (already patched)")
+        stats["applied"] += 1
+        ok["retry_after_hko"] = True
+    else:
+        print("  SKIP: Hko unified-reset guard not discovered", file=sys.stderr)
+        stats["failed"] += 1
+
+    # -- Patch 6: Hardcode QPe/SDK delay to 1s (Hko?? short-circuits WB) ------
+    # Watchdog 429 does `xt = Hko(reset) ?? WB(...)`. Hko returns ms until
+    # anthropic-ratelimit-unified-reset (often minutes). Non-null Hko wins,
+    # so Patch 5 never runs. Write `xt=1000` at the assignment.
+    print()
+    print("=== Patch 6: Hardcode API retry delay to 1s ===")
+    if qpe_wd_pair:
+        search, replace = qpe_wd_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data,
+            "Hardcode watchdog 429 delay to 1000ms (bypass Hko/WB)",
+            search,
+            replace,
+            stats,
+        )
+        ok["qpe_wd"] = stats["applied"] > _n
+    elif qpe_watchdog_delay_already_hardcoded(data):
+        print("  OK Hardcode watchdog 429 delay (already patched)")
+        stats["applied"] += 1
+        ok["qpe_wd"] = True
+    else:
+        print("  SKIP: QPe watchdog 429 delay assignment not discovered", file=sys.stderr)
+        stats["failed"] += 1
+
+    if qpe_plain_pair:
+        search, replace = qpe_plain_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data,
+            "Hardcode non-watchdog delay to 1000ms (bypass WB)",
+            search,
+            replace,
+            stats,
+        )
+        ok["qpe_plain"] = stats["applied"] > _n
+    elif qpe_plain_delay_already_hardcoded(data):
+        print("  OK Hardcode non-watchdog delay (already patched)")
+        stats["applied"] += 1
+        ok["qpe_plain"] = True
+    else:
+        print("  SKIP: QPe plain delay assignment not discovered", file=sys.stderr)
+        stats["failed"] += 1
+
+    sdk_hits = 0
+    if sdk_ms_pair:
+        search, replace = sdk_ms_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data, "Ignore SDK retry-after-ms header", search, replace, stats
+        )
+        if stats["applied"] > _n:
+            sdk_hits += 1
+    elif sdk_retry_after_already_ignored(data):
+        print("  OK Ignore SDK retry-after-ms (already patched)")
+        stats["applied"] += 1
+        sdk_hits += 1
+    else:
+        print("  SKIP: SDK retry-after-ms guard not discovered", file=sys.stderr)
+        stats["failed"] += 1
+
+    if sdk_ra_pair:
+        search, replace = sdk_ra_pair
+        _n = stats["applied"]
+        data = apply_byte_patch(
+            data, "Ignore SDK retry-after / HTTP-date header", search, replace, stats
+        )
+        if stats["applied"] > _n:
+            sdk_hits += 1
+    elif sdk_retry_after_already_ignored(data):
+        print("  OK Ignore SDK retry-after (already patched)")
+        stats["applied"] += 1
+        sdk_hits += 1
+    else:
+        print("  SKIP: SDK retry-after guard not discovered", file=sys.stderr)
+        stats["failed"] += 1
+    ok["sdk_ra"] = sdk_hits == 2
 
     # -- Summary ---------------------------------------------------------------
     print()
@@ -718,8 +1135,10 @@ def main():
     print("To restore the original binary:")
     print(f"  sudo python3 {sys.argv[0]} --restore")
     print()
-    print("Set this environment variable before running claude:")
+    print("Set these environment variables before running claude:")
     print("  export CLAUDE_CODE_MAX_RETRIES=9999       # Max retry attempts (internal cap disabled)")
+    print("  export CLAUDE_CODE_RETRY_WATCHDOG=1       # Persistent 429/overloaded retry")
+    print("  export BUN_JSC_forceDebuggerBytecodeGeneration=1  # Recompile patched source in Bun")
     print()
     print("Retry behavior after patching:")
     sep = "  +-------------------------+----------------------------------+"
@@ -746,6 +1165,10 @@ def main():
                _behavior([ok["rl_fallback"], ok["rl_min"], ok["rl_threshold"]], "Fixed ~1 second")))
     print(_row("SDK-level retry delay",
                _behavior([ok["sdk"]], "Fixed ~0.75-1 second")))
+    print(_row("Retry-After / reset",
+               _behavior([ok["retry_after_wb"], ok["retry_after_uko"], ok["retry_after_hko"],
+                          ok["qpe_wd"], ok["qpe_plain"], ok["sdk_ra"]],
+                         "ignored (always ~1s)")))
     print(sep)
     print()
     print("NOTE: After updating Claude Code (npm update), re-run this script.")
